@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from zeluxd.drivers import DriverRegistry, ManifestError, validate_manifest
+from zeluxd.drivers import DriverDescriptor, DriverRegistry, ManifestError, validate_manifest
 from zeluxd.protocol import negotiate, satisfies, version_tuple
 
 
@@ -77,12 +77,24 @@ class DriverRegistryTests(unittest.TestCase):
             registry = DriverRegistry("sim", _Hal(), state_dir=Path(temp), agent_version="1.0.0")
             out = registry.select("tof", "zelux.sim.tof")
             self.assertFalse(out["changed"])
+            self.assertFalse(out["restart_required"])
             self.assertTrue((Path(temp) / "selection.json").exists())
 
     def test_unknown_driver_cannot_be_selected(self):
         registry = DriverRegistry("sim", _Hal(), agent_version="1.0.0")
         with self.assertRaises(ManifestError):
             registry.select("tof", "zelux.tof.not-installed")
+
+    def test_changed_driver_is_pending_until_restart(self):
+        with TemporaryDirectory() as temp:
+            registry = DriverRegistry("sim", _Hal(), state_dir=Path(temp), agent_version="1.0.0")
+            candidate = DriverDescriptor("zelux.tof.alternate", "Alternate", "1.0.0", "tof",
+                                         models=("SIM-TOF-V2",))
+            registry._available[candidate.id] = candidate
+            out = registry.select("tof", candidate.id)
+            self.assertTrue(out["restart_required"])
+            self.assertEqual(registry.state()["pending"]["tof"], candidate.id)
+            self.assertEqual(registry.get("tof")["id"], "zelux.sim.tof")
 
     def test_manifest_validation(self):
         manifest = {

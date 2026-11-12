@@ -21,6 +21,7 @@ class _Registry:
     def get(self, device_class):
         return {"id": "zelux.tof.example", "version": "1.2.0",
                 "device_class": device_class,
+                "models": ["EXAMPLE-TOF"], "firmware_version": "1.0.0",
                 "firmware_upgrade_supported": self.supports_upgrade}
 
 
@@ -63,6 +64,19 @@ class FirmwareTests(unittest.TestCase):
             self.assertEqual(out["status"], "validated")
             self.assertFalse(out["trusted"])
             self.assertFalse(manager.state()["write_enabled"])
+
+    def test_state_explains_model_version_and_signature_compatibility(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            inbox = root / "firmware" / "inbox"
+            inbox.mkdir(parents=True)
+            package(inbox / "example.zfw", manifest())
+            manager = FirmwareManager(root / "firmware", _Registry(root), allow_untrusted=True)
+            manager.install_package("example.zfw")
+            item = manager.state()["packages"][0]
+            self.assertEqual(item["version_change"], "1.0.0 → 1.4.0")
+            self.assertFalse(item["compatible"])
+            self.assertIn("固件签名不受信任", item["compatibility_reasons"])
 
     def test_bad_hash_rejected(self):
         with TemporaryDirectory() as temp:

@@ -93,8 +93,34 @@ class FirmwareManager:
         return result
 
     def state(self) -> dict[str, Any]:
-        return {"inbox": self.inbox(), "packages": self.installed(),
+        packages = [self._compatibility(item) for item in self.installed()]
+        return {"inbox": self.inbox(), "packages": packages,
                 "job": None, "write_enabled": False}
+
+    def _compatibility(self, item: dict[str, Any]) -> dict[str, Any]:
+        active = self.driver_registry.get(str(item.get("device_class", "")))
+        active_models = set(active.get("detected_models") or active.get("models") or ()) if active else set()
+        firmware_models = set(item.get("models") or ())
+        model_ok = bool(active_models & firmware_models)
+        try:
+            driver_ok = bool(active and satisfies(str(active.get("version")), str(item.get("driver"))))
+        except ValueError:
+            driver_ok = False
+        reasons = []
+        if not active:
+            reasons.append("没有活动驱动")
+        if active and not model_ok:
+            reasons.append("设备型号不匹配")
+        if active and not driver_ok:
+            reasons.append("驱动版本不兼容")
+        if not item.get("trusted"):
+            reasons.append("固件签名不受信任")
+        compatible = bool(active and model_ok and driver_ok and item.get("trusted"))
+        current = active.get("firmware_version") if active else None
+        return {**item, "compatible": compatible, "compatibility_reasons": reasons,
+                "detected_models": sorted(active_models), "current_version": current,
+                "version_change": f"{current or '未知'} → {item.get('version', '未知')}",
+                "risk": "high" if item.get("device_class") == "servo" else "medium"}
 
     def check_manifest(self, raw: Any) -> dict[str, Any]:
         return validate_firmware_manifest(raw)

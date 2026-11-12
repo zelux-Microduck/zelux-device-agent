@@ -39,6 +39,7 @@ class DriverDescriptor:
     driver_api: str = DRIVER_API_SUPPORTED
     firmware_version: str | None = None
     firmware_upgrade_supported: bool = False
+    models: tuple[str, ...] = ()
     capabilities: dict[str, Any] = field(default_factory=dict)
 
     def public(self, *, active: bool = True, health: str = "unknown") -> dict[str, Any]:
@@ -130,28 +131,33 @@ def zip_entry_is_symlink(info: zipfile.ZipInfo) -> bool:
 
 SIM_DRIVERS = (
     DriverDescriptor("zelux.sim.servo", "模拟舵机", "1.0.0", "servo",
-                     capabilities={"count": 15, "bus": "sim", "firmware": False}),
+                     models=("SIM-SERVO",), capabilities={"count": 15, "bus": "sim", "firmware": False}),
     DriverDescriptor("zelux.sim.tof", "模拟 8×8 ToF", "1.0.0", "tof",
-                     capabilities={"resolutions": [[8, 8]], "max_hz": 15, "firmware": False}),
+                     models=("SIM-TOF",), capabilities={"resolutions": [[8, 8]], "max_hz": 15, "firmware": False}),
     DriverDescriptor("zelux.sim.camera", "模拟摄像头", "1.0.0", "camera",
-                     capabilities={"snapshot": True, "stream": False, "firmware": False}),
+                     models=("SIM-CAMERA",), capabilities={"snapshot": True, "stream": False, "firmware": False}),
     DriverDescriptor("zelux.sim.fan", "模拟双风扇", "1.0.0", "fan",
-                     capabilities={"channels": 2, "pwm": True, "tach": [False, True]}),
+                     models=("SIM-FAN",), capabilities={"channels": 2, "pwm": True, "tach": [False, True]}),
     DriverDescriptor("zelux.sim.imu", "模拟 IMU", "1.0.0", "imu",
-                     capabilities={"calibration": True, "firmware": False}),
+                     models=("SIM-IMU",), capabilities={"calibration": True, "firmware": False}),
 )
 
 RADXA_DRIVERS = (
-    DriverDescriptor("zelux.servo.feetech-sts3215", "Feetech STS3215", "1.0.0", "servo",
+    DriverDescriptor("zelux.servo.feetech-sts-scs", "Feetech STS/SCS", "1.1.0", "servo",
+                     models=("STS3215", "STS", "SCS"),
                      capabilities={"count": 15, "bus": "serial", "baud": 1_000_000,
                                    "firmware": False}),
-    DriverDescriptor("zelux.tof.vl53l5cx", "VL53L5CX", "1.0.0", "tof",
+    DriverDescriptor("zelux.tof.st-vl53l5cx", "VL53L5CX", "1.1.0", "tof",
+                     models=("VL53L5CX",),
                      capabilities={"resolutions": [[8, 8]], "max_hz": 15, "firmware": False}),
-    DriverDescriptor("zelux.camera.v4l2", "V4L2 / libcamera", "1.0.0", "camera",
+    DriverDescriptor("zelux.camera.v4l2-libcamera", "V4L2 / libcamera", "1.1.0", "camera",
+                     models=("UVC", "V4L2", "libcamera"),
                      capabilities={"snapshot": True, "stream": True, "firmware": False}),
-    DriverDescriptor("zelux.fan.radxa-pwm", "Radxa PWM Fan", "1.0.0", "fan",
+    DriverDescriptor("zelux.fan.radxa-zero3w-dual-pwm", "Radxa 双路 PWM 风扇", "1.1.0", "fan",
+                     models=("Zero 3W dual PWM fan",),
                      capabilities={"channels": 2, "pwm": True, "tach": [False, True]}),
-    DriverDescriptor("zelux.imu.qmi8658-compatible", "QMI8658/MPU6050/ICM42688", "1.0.0", "imu",
+    DriverDescriptor("zelux.imu.multi-i2c", "QMI8658/MPU6050/ICM42688", "1.1.0", "imu",
+                     models=("QMI8658", "MPU6050", "ICM42688"),
                      capabilities={"calibration": True, "firmware": False}),
 )
 
@@ -171,6 +177,7 @@ class DriverRegistry:
         descriptors = SIM_DRIVERS if mode == "sim" else RADXA_DRIVERS
         self._available = {item.id: item for item in descriptors}
         self._active = {item.device_class: item for item in descriptors}
+        self._pending: dict[str, DriverDescriptor] = {}
         self._load_selection()
 
     def _load_selection(self) -> None:
@@ -186,12 +193,13 @@ class DriverRegistry:
             # 损坏的选择文件不能阻止设备启动；保留内置默认驱动。
             return
 
-    def _save_selection(self) -> None:
+    def _save_selection(self, selected: dict[str, DriverDescriptor] | None = None) -> None:
         if not self.selection_path:
             return
         self.selection_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.selection_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({key: value.id for key, value in self._active.items()},
+        desired = selected or self._active
+        tmp.write_text(json.dumps({key: value.id for key, value in desired.items()},
                                   ensure_ascii=False, indent=2), "utf-8")
         tmp.replace(self.selection_path)
 
@@ -220,22 +228,52 @@ class DriverRegistry:
             for name, driver in self._active.items()
         }
 
+    def _detected_models(self, device_class: str, driver: DriverDescriptor) -> list[str]:
+        if self.mode == "sim":
+            return list(driver.models[:1])
+        try:
+            if device_class == "imu":
+                chip = self.hal.snapshot_imu().get("chip")
+                return [str(chip).upper()] if chip and chip != "?" else []
+            if device_class == "tof":
+                sensor = self.hal.snapshot_tof().get("sensor")
+                return [str(sensor).upper()] if sensor else []
+            if device_class in ("servo", "fan"):
+                return list(driver.models[:1])
+            if device_class == "camera":
+                info = self.hal.info().get("camera", {})
+                return [str(info.get("driver", "V4L2"))] if info.get("available") else []
+        except Exception:
+            return []
+        return []
+
+    def _public(self, device_class: str, driver: DriverDescriptor, *, active: bool = True) -> dict[str, Any]:
+        out = driver.public(active=active, health=self._health(device_class))
+        detected = self._detected_models(device_class, driver) if active else []
+        out.update({"detected_models": detected, "current_model": detected[0] if detected else None,
+                    "compatible": True, "compatibility_reason": "Driver API compatible"})
+        return out
+
     def state(self) -> dict[str, Any]:
+        pending = {name: item.id for name, item in self._pending.items()
+                   if self._active.get(name) is not item}
         return {
             "api_version": DRIVER_API_VERSION,
             "api_supported": DRIVER_API_SUPPORTED,
-            "items": [driver.public(health=self._health(name))
+            "items": [self._public(name, driver)
                       for name, driver in sorted(self._active.items())],
-            "available": [driver.public(active=driver is self._active.get(driver.device_class),
-                                         health=self._health(driver.device_class))
+            "available": [self._public(driver.device_class, driver,
+                                        active=driver is self._active.get(driver.device_class))
                           for driver in sorted(self._available.values(), key=lambda item: item.id)],
             "packages": self.installed_packages(),
             "inbox": self.inbox(),
+            "pending": pending,
+            "restart_required": bool(pending),
         }
 
     def get(self, device_class: str) -> dict[str, Any] | None:
         driver = self._active.get(device_class)
-        return driver.public(health=self._health(device_class)) if driver else None
+        return self._public(device_class, driver) if driver else None
 
     def probe(self, device_class: str | None = None) -> list[dict[str, Any]]:
         classes = [device_class] if device_class else sorted(self._active)
@@ -266,11 +304,17 @@ class DriverRegistry:
             raise ManifestError("驱动类型与设备类型不一致")
         old = self._active.get(device_class)
         check = self.self_test(device_class) if old and old.id == candidate.id else None
-        # 当前阶段只注册内置实现；未来候选实现会在这里先隔离 probe/self-test 再切换。
-        self._active[device_class] = candidate
-        self._save_selection()
+        desired = dict(self._active)
+        desired.update(self._pending)
+        desired[device_class] = candidate
+        if old is candidate:
+            self._pending.pop(device_class, None)
+        else:
+            self._pending[device_class] = candidate
+        self._save_selection(desired)
         return {"ok": True, "device_class": device_class, "from": old.id if old else None,
-                "to": candidate.id, "changed": old is not candidate, "self_test": check}
+                "to": candidate.id, "changed": old is not candidate, "self_test": check,
+                "restart_required": old is not candidate, "applied": old is candidate}
 
     def check_manifest(self, raw: Any) -> dict[str, Any]:
         return validate_manifest(raw, agent_version=self.agent_version)
