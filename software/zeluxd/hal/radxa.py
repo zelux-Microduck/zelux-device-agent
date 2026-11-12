@@ -25,7 +25,7 @@ from pathlib import Path
 from .base import JOINT_IDS, Hal
 try:
     # 正式路径：驱动由独立仓库/包发布，Agent 不随驱动版本一起升级。
-    from zelux_drivers.radxa import RadxaFan, RadxaIMU, RadxaServo, RadxaTof
+    from zelux_drivers.radxa import RadxaCamera, RadxaFan, RadxaIMU, RadxaServo, RadxaTof
 
     DRIVER_SOURCE = "zelux-device-drivers"
 except ImportError:
@@ -34,6 +34,8 @@ except ImportError:
     from .radxa_imu import RadxaIMU
     from .radxa_servo import RadxaServo
     from .radxa_tof import RadxaTof
+
+    RadxaCamera = None
 
     DRIVER_SOURCE = "builtin-fallback"
 
@@ -50,6 +52,7 @@ class RadxaHal(Hal):
         self.imu = RadxaIMU(ctx)
         self.tof = RadxaTof(ctx, bus=ctx.config.i2c_bus, addr=ctx.config.tof_addr)
         self.fan = RadxaFan(ctx)
+        self.camera = RadxaCamera(ctx) if RadxaCamera is not None else None
         self._power = {"pct": None, "v": None, "source": "none"}
         self._temp: float | None = None
         self._motion_sock = Path("/run/zelux/motiond.sock")
@@ -58,7 +61,10 @@ class RadxaHal(Hal):
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
-        for name, part in (("舵机", self.servo), ("IMU", self.imu), ("ToF", self.tof), ("风扇", self.fan)):
+        parts = [("舵机", self.servo), ("IMU", self.imu), ("ToF", self.tof), ("风扇", self.fan)]
+        if self.camera is not None:
+            parts.append(("摄像头", self.camera))
+        for name, part in parts:
             try:
                 await part.start()
                 self.log.info("%s 已启动", name)
@@ -69,7 +75,9 @@ class RadxaHal(Hal):
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()
-        for part in (self.servo, self.imu, self.tof, self.fan):
+        for part in (self.servo, self.imu, self.tof, self.fan, self.camera):
+            if part is None:
+                continue
             try:
                 await part.stop()
             except Exception:
@@ -79,6 +87,7 @@ class RadxaHal(Hal):
         return {"backend": "radxa", "driver_source": DRIVER_SOURCE,
                 "servo": self.servo.info(), "imu": self.imu.info(),
                 "tof": self.tof.info(), "fan": self.fan.info(),
+                "camera": self.camera.info() if self.camera else {"available": False, "driver": "builtin"},
                 "motiond": self._motion_sock.exists()}
 
     # ---------------- 舵机 ----------------
@@ -205,6 +214,8 @@ class RadxaHal(Hal):
 
     # ---------------- 视觉 ----------------
     async def camera_snapshot(self, path: str) -> bool:
+        if self.camera is not None:
+            return await self.camera.snapshot(path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         dev = self._video_device()
         cmds = []
@@ -234,6 +245,8 @@ class RadxaHal(Hal):
 
     def camera_stream_url(self) -> str | None:
         """摄像头实时流由 media 侧（WebRTC/go2rtc）提供；没起就返回 None，前端显示占位。"""
+        if self.camera is not None:
+            return self.camera.stream_url()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(0.15)
         try:
