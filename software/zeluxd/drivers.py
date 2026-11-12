@@ -176,9 +176,37 @@ class DriverRegistry:
         self.trusted_keys_dir = self.state_dir / "trusted_keys" if self.state_dir else None
         descriptors = SIM_DRIVERS if mode == "sim" else RADXA_DRIVERS
         self._available = {item.id: item for item in descriptors}
+        if mode != "sim":
+            try:
+                from zelux_drivers import descriptors as package_descriptors
+
+                for item in package_descriptors():
+                    caps = {name: True for name in item.capabilities}
+                    candidate = DriverDescriptor(item.id, item.id, item.version, item.kind.value,
+                                                 provider=item.vendor, driver_api=item.protocol,
+                                                 models=item.models, capabilities=caps,
+                                                 firmware_upgrade_supported="firmware-upgrade" in item.capabilities)
+                    self._available.setdefault(candidate.id, candidate)
+            except ImportError:
+                pass
         self._active = {item.device_class: item for item in descriptors}
         self._pending: dict[str, DriverDescriptor] = {}
         self._load_selection()
+        self._sync_hal_report()
+
+    def _sync_hal_report(self) -> None:
+        report = getattr(self.hal, "driver_report", None)
+        if not isinstance(report, dict):
+            return
+        for device_class, detail in report.items():
+            loaded = self._available.get(str(detail.get("loaded") or ""))
+            requested = self._available.get(str(detail.get("requested") or ""))
+            if loaded and loaded.device_class == device_class:
+                self._active[device_class] = loaded
+            if requested and loaded is not requested:
+                self._pending[device_class] = requested
+            elif requested is loaded:
+                self._pending.pop(device_class, None)
 
     def _load_selection(self) -> None:
         if not self.selection_path or not self.selection_path.exists():
@@ -252,9 +280,13 @@ class DriverRegistry:
         detected = self._detected_models(device_class, driver) if active else []
         out.update({"detected_models": detected, "current_model": detected[0] if detected else None,
                     "compatible": True, "compatibility_reason": "Driver API compatible"})
+        report = getattr(self.hal, "driver_report", {}).get(device_class, {}) if active else {}
+        out.update({"load_fallback": bool(report.get("fallback")),
+                    "load_error": report.get("error")})
         return out
 
     def state(self) -> dict[str, Any]:
+        self._sync_hal_report()
         pending = {name: item.id for name, item in self._pending.items()
                    if self._active.get(name) is not item}
         return {
@@ -272,6 +304,7 @@ class DriverRegistry:
         }
 
     def get(self, device_class: str) -> dict[str, Any] | None:
+        self._sync_hal_report()
         driver = self._active.get(device_class)
         return self._public(device_class, driver) if driver else None
 

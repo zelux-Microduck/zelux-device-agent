@@ -25,6 +25,7 @@ from pathlib import Path
 from .base import JOINT_IDS, Hal
 try:
     # 正式路径：驱动由独立仓库/包发布，Agent 不随驱动版本一起升级。
+    from zelux_drivers import create as create_driver
     from zelux_drivers.radxa import RadxaCamera, RadxaFan, RadxaIMU, RadxaServo, RadxaTof
 
     DRIVER_SOURCE = "zelux-device-drivers"
@@ -36,39 +37,112 @@ except ImportError:
     from .radxa_tof import RadxaTof
 
     RadxaCamera = None
+    create_driver = None
 
     DRIVER_SOURCE = "builtin-fallback"
 
 SERVO_MIN_V = 6.4     # 2S 锂电保护点
 SERVO_MAX_V = 8.1     # 满电
+DEFAULT_DRIVER_IDS = {
+    "servo": "zelux.servo.feetech-sts-scs",
+    "tof": "zelux.tof.st-vl53l5cx",
+    "camera": "zelux.camera.v4l2-libcamera",
+    "fan": "zelux.fan.radxa-zero3w-dual-pwm",
+    "imu": "zelux.imu.multi-i2c",
+}
 
 
 class RadxaHal(Hal):
     backend = "radxa"
 
-    def __init__(self, ctx) -> None:
+    def __init__(self, ctx, selection: dict[str, str] | None = None, factory=None) -> None:
         super().__init__(ctx)
-        self.servo = RadxaServo(ctx)
-        self.imu = RadxaIMU(ctx)
-        self.tof = RadxaTof(ctx, bus=ctx.config.i2c_bus, addr=ctx.config.tof_addr)
-        self.fan = RadxaFan(ctx)
-        self.camera = RadxaCamera(ctx) if RadxaCamera is not None else None
+        self._selection = dict(selection or {})
+        self._factory = factory if factory is not None else create_driver
+        self.driver_report: dict[str, dict] = {}
+        self.servo = self._construct("servo")
+        self.imu = self._construct("imu")
+        self.tof = self._construct("tof")
+        self.fan = self._construct("fan")
+        self.camera = self._construct("camera")
         self._power = {"pct": None, "v": None, "source": "none"}
         self._temp: float | None = None
         self._motion_sock = Path("/run/zelux/motiond.sock")
         self._tasks: list[asyncio.Task] = []
         self._intent = {"vx": 0.0, "vy": 0.0, "wz": 0.0, "ts": 0.0}
 
+    def _args(self, kind: str) -> tuple[tuple, dict]:
+        if kind == "tof":
+            return (self.ctx,), {"bus": self.ctx.config.i2c_bus, "addr": self.ctx.config.tof_addr}
+        return (self.ctx,), {}
+
+    def _builtin(self, kind: str):
+        classes = {"servo": RadxaServo, "imu": RadxaIMU, "tof": RadxaTof,
+                   "fan": RadxaFan, "camera": RadxaCamera}
+        cls = classes[kind]
+        if cls is None:
+            return None
+        args, kwargs = self._args(kind)
+        return cls(*args, **kwargs)
+
+    def _construct(self, kind: str, *, force_default: bool = False):
+        wanted = DEFAULT_DRIVER_IDS[kind] if force_default else self._selection.get(kind, DEFAULT_DRIVER_IDS[kind])
+        args, kwargs = self._args(kind)
+        try:
+            if self._factory is None:
+                raise ImportError("独立驱动包未安装")
+            part = self._factory(wanted, *args, **kwargs)
+            self.driver_report[kind] = {"requested": self._selection.get(kind, wanted), "loaded": wanted,
+                                        "fallback": force_default, "error": None}
+            return part
+        except Exception as exc:
+            if wanted != DEFAULT_DRIVER_IDS[kind]:
+                self.log.error("%s 驱动 %s 构造失败（%s），回退默认驱动", kind, wanted, exc)
+                part = self._construct(kind, force_default=True)
+                self.driver_report[kind].update({"requested": wanted, "fallback": True,
+                                                 "error": f"构造失败：{exc}"})
+                return part
+            try:
+                part = self._builtin(kind)
+                self.driver_report[kind] = {"requested": self._selection.get(kind, wanted),
+                                            "loaded": wanted if part is not None else None,
+                                            "fallback": True, "error": f"独立包加载失败：{exc}"}
+                return part
+            except Exception as fallback_exc:
+                self.driver_report[kind] = {"requested": self._selection.get(kind, wanted), "loaded": None,
+                                            "fallback": True, "error": f"默认驱动构造失败：{fallback_exc}"}
+                return None
+
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
-        parts = [("舵机", self.servo), ("IMU", self.imu), ("ToF", self.tof), ("风扇", self.fan)]
-        if self.camera is not None:
-            parts.append(("摄像头", self.camera))
-        for name, part in parts:
+        parts = [("servo", "舵机"), ("imu", "IMU"), ("tof", "ToF"),
+                 ("fan", "风扇"), ("camera", "摄像头")]
+        for kind, name in parts:
+            part = getattr(self, kind)
+            if part is None:
+                continue
             try:
                 await part.start()
                 self.log.info("%s 已启动", name)
             except Exception as exc:
+                report = self.driver_report[kind]
+                if report.get("loaded") != DEFAULT_DRIVER_IDS[kind]:
+                    self.log.error("%s 的所选驱动起不来（%s），尝试默认驱动", name, exc)
+                    try:
+                        await part.stop()
+                    except Exception:
+                        pass
+                    fallback = self._construct(kind, force_default=True)
+                    setattr(self, kind, fallback)
+                    try:
+                        await fallback.start()
+                        self.driver_report[kind].update({"requested": report.get("requested"), "fallback": True,
+                                                         "error": f"启动失败：{exc}"})
+                        continue
+                    except Exception as fallback_exc:
+                        self.driver_report[kind]["error"] = f"所选驱动：{exc}；默认驱动：{fallback_exc}"
+                if not self.driver_report[kind].get("error"):
+                    self.driver_report[kind]["error"] = f"启动失败：{exc}"
                 self.log.error("%s 起不来（%s），这一块会显示不可用", name, exc)
         self._tasks = [asyncio.create_task(self._poll_power()), asyncio.create_task(self._poll_temp())]
 
@@ -84,9 +158,11 @@ class RadxaHal(Hal):
                 pass
 
     def info(self) -> dict:
-        return {"backend": "radxa", "driver_source": DRIVER_SOURCE,
-                "servo": self.servo.info(), "imu": self.imu.info(),
-                "tof": self.tof.info(), "fan": self.fan.info(),
+        return {"backend": "radxa", "driver_source": DRIVER_SOURCE, "drivers": self.driver_report,
+                "servo": self.servo.info() if self.servo else {"available": False},
+                "imu": self.imu.info() if self.imu else {"available": False},
+                "tof": self.tof.info() if self.tof else {"available": False},
+                "fan": self.fan.info() if self.fan else {"available": False},
                 "camera": self.camera.info() if self.camera else {"available": False, "driver": "builtin"},
                 "motiond": self._motion_sock.exists()}
 

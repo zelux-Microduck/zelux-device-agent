@@ -20,7 +20,7 @@ import types
 from typing import Any
 
 from .errors import ZeluxError
-from .hal import create_hal
+from .hal import create_hal, load_driver_selection
 from .drivers import DriverRegistry
 from .firmware import FirmwareManager
 
@@ -102,7 +102,8 @@ class Hub:
         cfg.ensure_dirs()
         self.ctx = types.SimpleNamespace(config=cfg, log=logging.getLogger("zeluxd"), hub=self,
                                          state={}, hal=None, version=__import__("zeluxd").__version__)
-        self.hal = create_hal(self.ctx)
+        selection = load_driver_selection(cfg.drivers_dir / "selection.json")
+        self.hal = create_hal(self.ctx, selection=selection)
         self.ctx.hal = self.hal
         self.driver_registry = DriverRegistry(cfg.mode, self.hal, state_dir=cfg.drivers_dir,
                                               agent_version=self.ctx.version,
