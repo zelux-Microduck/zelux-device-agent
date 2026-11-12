@@ -21,3 +21,6 @@ python -m zeluxd.tests.test_firmware
 
 公共消息契约来自 `zelux-protocol`。具体型号驱动将由 `zelux-device-drivers` 发布，
 本仓库只保留迁移期内置实现和 Driver API。
+
+真机启动时优先导入独立的 `zelux-device-drivers` 包；包不存在才使用内置回退实现。
+诊断接口中的 `hal.driver_source` 会明确报告实际来源。

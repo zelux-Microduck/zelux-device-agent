@@ -15,3 +15,6 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["software"]
 include = ["zeluxd*"]
+
+[project.optional-dependencies]
+hardware = ["zelux-device-drivers>=1.0.0,<2.0.0"]

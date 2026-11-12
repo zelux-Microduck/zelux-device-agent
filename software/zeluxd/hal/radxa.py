@@ -23,10 +23,19 @@ import time
 from pathlib import Path
 
 from .base import JOINT_IDS, Hal
-from .radxa_fan import RadxaFan
-from .radxa_imu import RadxaIMU
-from .radxa_servo import RadxaServo
-from .radxa_tof import RadxaTof
+try:
+    # 正式路径：驱动由独立仓库/包发布，Agent 不随驱动版本一起升级。
+    from zelux_drivers.radxa import RadxaFan, RadxaIMU, RadxaServo, RadxaTof
+
+    DRIVER_SOURCE = "zelux-device-drivers"
+except ImportError:
+    # 迁移期兼容：旧镜像尚未安装独立驱动包时继续可启动。
+    from .radxa_fan import RadxaFan
+    from .radxa_imu import RadxaIMU
+    from .radxa_servo import RadxaServo
+    from .radxa_tof import RadxaTof
+
+    DRIVER_SOURCE = "builtin-fallback"
 
 SERVO_MIN_V = 6.4     # 2S 锂电保护点
 SERVO_MAX_V = 8.1     # 满电
@@ -67,7 +76,8 @@ class RadxaHal(Hal):
                 pass
 
     def info(self) -> dict:
-        return {"backend": "radxa", "servo": self.servo.info(), "imu": self.imu.info(),
+        return {"backend": "radxa", "driver_source": DRIVER_SOURCE,
+                "servo": self.servo.info(), "imu": self.imu.info(),
                 "tof": self.tof.info(), "fan": self.fan.info(),
                 "motiond": self._motion_sock.exists()}
 
