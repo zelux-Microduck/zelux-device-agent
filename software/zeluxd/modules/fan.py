@@ -65,6 +65,8 @@ class Module(BaseModule):
             "virtual": virtual,
             "source": getattr(self._driver, "source", None) or ("hal" if self._control == "hal" else "none"),
             "pct": self._last_pct if self._last_pct is not None else snap.get("pct", DEFAULT_PCT),
+            "pin_config": {"channels": [dict(item) for item in getattr(self.config, "fan_channels", [])],
+                           "restart_required": False},
         })
         return {"fan": snap}
 
@@ -125,6 +127,8 @@ class Module(BaseModule):
             return await self._set_mode("manual", args)
         if op == "curve":
             return self._set_curve(args)
+        if op in ("pin_config", "pins"):
+            return self._set_pin_config(args)
         if op in ("self_test", "selftest", "test"):
             return await self._self_test(args)
         if op == "read":
@@ -133,6 +137,27 @@ class Module(BaseModule):
             return {"ok": True, "fan": self.state()["fan"]}
         raise ZeluxError(f"fan 不支持 {op}（可用：auto/manual/curve/read/self_test/status）",
                          "unsupported")
+
+    def _set_pin_config(self, args: dict) -> dict:
+        channels = args.get("channels")
+        if not isinstance(channels, list) or len(channels) != 2:
+            raise ZeluxError("风扇引脚必须包含两路配置", "denied")
+        out = []
+        for index, item in enumerate(channels):
+            if not isinstance(item, dict):
+                raise ZeluxError(f"第 {index} 路配置格式错误", "denied")
+            try:
+                pwm, gpio = int(item["pwm"]), int(item["gpio"])
+                tach = None if item.get("tach") in (None, "") else int(item["tach"])
+            except (KeyError, TypeError, ValueError):
+                raise ZeluxError(f"第 {index} 路 PWM/GPIO/Tach 必须是整数", "denied") from None
+            if not (0 <= pwm <= 255 and 0 <= gpio <= 1023 and (tach is None or 0 <= tach <= 1023)):
+                raise ZeluxError(f"第 {index} 路引脚超出允许范围", "denied")
+            out.append({"name": str(item.get("name") or f"风扇 {index + 1}")[:32], "pwm": pwm,
+                        "gpio": gpio, "pin": str(item.get("pin") or "")[:64], "tach": tach})
+        self.config.save_hardware("fan", {"channels": out})
+        return {"ok": True, "channels": out, "restart_required": True,
+                "note": "配置已保存，重启后重新初始化 PWM 和 Tach"}
 
     async def _set_mode(self, mode: str, args: dict) -> dict:
         if mode == "auto":

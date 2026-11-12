@@ -237,6 +237,8 @@ class Module(BaseModule):
             "frames": self._frames,
             "estop": (self.ctx.hub.estop or {}).get("state") if self.ctx.hub else None,
         }
+        snap["pin_config"] = {"i2c_bus": getattr(self.config, "i2c_bus", 3),
+                              "address": getattr(self.config, "tof_addr", 0x52), "restart_required": False}
         return {"tof": snap}
 
     # ---------------- 命令 ----------------
@@ -256,11 +258,26 @@ class Module(BaseModule):
             return await self._stop()
         if op == "config":
             return self._config(args)
+        if op in ("pin_config", "pins"):
+            return self._pin_config(args)
         if op == "simulate":
             return await self._simulate(args)
         if op in ("status", ""):
             return {"ok": True, "tof": self.state()["tof"]}
         raise ZeluxError(f"tof 不支持 {op}（可用：on/off/config/simulate/status）", "unsupported")
+
+    def _pin_config(self, args: dict) -> dict:
+        try:
+            bus = int(args.get("i2c_bus"))
+            raw = args.get("address")
+            address = int(raw, 0) if isinstance(raw, str) else int(raw)
+        except (TypeError, ValueError):
+            raise ZeluxError("I²C 总线和地址格式不正确", "denied") from None
+        if not (0 <= bus <= 32 and 0x08 <= address <= 0xFE):
+            raise ZeluxError("I²C 总线需为 0–32，地址需为 0x08–0xFE", "denied")
+        self.config.save_hardware("tof", {"i2c_bus": bus, "address": address})
+        return {"ok": True, "i2c_bus": bus, "address": address,
+                "restart_required": True, "note": "配置已保存，重启后重新打开 I²C 设备"}
 
     def _config(self, args: dict) -> dict:
         merged = dict(self.cfg)

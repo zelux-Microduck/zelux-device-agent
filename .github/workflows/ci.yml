@@ -15,6 +15,7 @@ jobs:
         run: |
           python -m zeluxd.tests.test_protocol_drivers
           python -m zeluxd.tests.test_hal_selection
+          python -m zeluxd.tests.test_hardware_config
           python -m zeluxd.tests.test_firmware
           python -m zeluxd.tests.test_servo_proto
           python -m zeluxd.tests.test_avoid

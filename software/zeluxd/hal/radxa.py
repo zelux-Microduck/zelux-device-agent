@@ -74,6 +74,9 @@ class RadxaHal(Hal):
     def _args(self, kind: str) -> tuple[tuple, dict]:
         if kind == "tof":
             return (self.ctx,), {"bus": self.ctx.config.i2c_bus, "addr": self.ctx.config.tof_addr}
+        if kind == "fan":
+            channels = getattr(self.ctx.config, "fan_channels", None)
+            return ((self.ctx,), {"fans": tuple(dict(item) for item in channels)}) if channels else ((self.ctx,), {})
         return (self.ctx,), {}
 
     def _builtin(self, kind: str):
