@@ -1,0 +1,30 @@
+{
+  "id": "weather",
+  "name": "天气",
+  "version": "1.0.0",
+  "author": "ZELUX 智造社",
+  "description": "查某个城市现在的天气和今天的温度范围",
+  "triggers": [
+    "天气",
+    "气温",
+    "多少度",
+    "下雨",
+    "冷不冷",
+    "热不热",
+    "穿什么",
+    "要不要带伞"
+  ],
+  "params": [
+    {
+      "name": "city",
+      "type": "str",
+      "required": false,
+      "description": "城市名",
+      "ask": "哪个城市的天气",
+      "pattern": "(?:查|看看|问一下)?\\s*([\\u4e00-\\u9fa5]{2,8}?)(?:今天|明天|现在|的)?(?:天气|气温|多少度|下雨|冷不冷|热不热)"
+    }
+  ],
+  "permissions": ["network"],
+  "needs": ["network"],
+  "priority": 80
+}

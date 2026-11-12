@@ -1,0 +1,34 @@
+{
+  "id": "express",
+  "name": "快递查询",
+  "version": "1.0.0",
+  "author": "ZELUX 智造社",
+  "description": "按运单号查快递到哪了（快递100，需要在设置页填 key 和 customer）",
+  "triggers": [
+    "快递",
+    "包裹",
+    "物流",
+    "到哪了",
+    "签收",
+    "运单号"
+  ],
+  "params": [
+    {
+      "name": "num",
+      "type": "str",
+      "required": true,
+      "description": "运单号",
+      "ask": "运单号",
+      "pattern": "([A-Za-z]{2,4}\\d{8,20}|\\d{10,20})"
+    },
+    {
+      "name": "com",
+      "type": "str",
+      "required": false,
+      "description": "快递公司代码，如 shunfeng；不填就按单号前缀猜"
+    }
+  ],
+  "permissions": ["network"],
+  "needs": ["network"],
+  "priority": 85
+}

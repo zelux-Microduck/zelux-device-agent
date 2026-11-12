@@ -1,0 +1,11 @@
+# 核心（必须）
+fastapi>=0.110
+uvicorn[standard]>=0.27
+cryptography>=42       # .zdp/.zfw Ed25519 发布签名验证
+
+# 真机/进阶能力（缺了也能跑，模块会自己降级）
+# numpy>=1.26           # 视觉、IMU 解算、策略推理
+# onnxruntime>=1.17     # 动作策略（.onnx）
+# httpx>=0.27           # AI 云服务
+# pyserial>=3.5         # 舵机总线（也可以用内置实现，见 hal/radxa_servo.py）
+# smbus2>=0.4           # ToF（I²C）
