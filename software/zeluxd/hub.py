@@ -95,6 +95,7 @@ class Hub:
         self.driver_registry = None
         self.firmware_manager = None
         self.ctx = None
+        self.imu_publisher = None
 
     # ---------------- 组装 ----------------
     async def boot(self) -> None:
@@ -112,6 +113,11 @@ class Hub:
                                                 allow_untrusted=cfg.dev)
         self._load_modules()
         await self.hal.start()
+        if cfg.robotd_imu_publish:
+            from .imu_publish import ImuPublisher
+
+            self.imu_publisher = ImuPublisher(self.hal, cfg.robotd_imu_socket)
+            await self.imu_publisher.start()
         for m in self.modules.values():
             try:
                 await m.start()
@@ -153,6 +159,8 @@ class Hub:
             except Exception:
                 pass
         if self.hal:
+            if self.imu_publisher:
+                await self.imu_publisher.stop()
             await self.hal.stop()
 
     # ---------------- 状态 ----------------

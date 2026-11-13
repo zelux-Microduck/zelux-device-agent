@@ -25,7 +25,7 @@ from pathlib import Path
 from .base import JOINT_IDS, Hal
 try:
     # 正式路径：驱动由独立仓库/包发布，Agent 不随驱动版本一起升级。
-    from zelux_drivers import create as create_driver
+    from zelux_drivers import create as create_driver, descriptor as driver_descriptor
     from zelux_drivers.radxa import RadxaCamera, RadxaFan, RadxaIMU, RadxaServo, RadxaTof
 
     DRIVER_SOURCE = "zelux-device-drivers"
@@ -38,6 +38,7 @@ except ImportError:
 
     RadxaCamera = None
     create_driver = None
+    driver_descriptor = None
 
     DRIVER_SOURCE = "builtin-fallback"
 
@@ -95,7 +96,9 @@ class RadxaHal(Hal):
             if self._factory is None:
                 raise ImportError("独立驱动包未安装")
             part = self._factory(wanted, *args, **kwargs)
+            version = driver_descriptor(wanted).version if driver_descriptor else None
             self.driver_report[kind] = {"requested": self._selection.get(kind, wanted), "loaded": wanted,
+                                        "version": version,
                                         "fallback": force_default, "error": None}
             return part
         except Exception as exc:

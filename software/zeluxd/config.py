@@ -46,6 +46,9 @@ class Config:
         self.i2c_bus = int(os.environ.get("ZELUX_I2C_BUS", "3"))
         self.tof_addr = int(os.environ.get("ZELUX_TOF_ADDR", "0x52"), 16)
         self.fan_socket = os.environ.get("ZELUX_FAN_SOCK", "/run/zelux/fan.sock")
+        self.robotd_imu_socket = os.environ.get(
+            "ZELUX_ROBOTD_IMU_SOCK", "/run/zelux/robotd-imu.sock")
+        self.robotd_imu_publish = _flag("ZELUX_ROBOTD_IMU_PUBLISH", self.mode == "radxa")
         self.fan_channels = [
             {"name": "顶部风扇", "pwm": 14, "gpio": 116, "pin": "GPIO3_C4", "tach": None},
             {"name": "主板散热", "pwm": 12, "gpio": 149, "pin": "GPIO4_C6/PIN_24", "tach": 150},
