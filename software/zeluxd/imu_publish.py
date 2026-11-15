@@ -6,12 +6,14 @@ import json
 import logging
 import socket
 import time
+import uuid
 from pathlib import Path
 
 log = logging.getLogger("zeluxd.imu_publish")
 
 
-def packet(snapshot: dict, sequence: int, driver: dict | None = None) -> dict | None:
+def packet(snapshot: dict, sequence: int, driver: dict | None = None,
+           publisher_id: str = "test-publisher") -> dict | None:
     """Build the versioned control packet; incomplete UI-only snapshots are not measurements."""
     required = ("gyro_rad_s", "gravity", "quaternion_wxyz")
     if not snapshot.get("ok") or any(key not in snapshot for key in required):
@@ -20,13 +22,13 @@ def packet(snapshot: dict, sequence: int, driver: dict | None = None) -> dict | 
     age_ms = snapshot.get("age_ms")
     return {
         "schema": "zelux.robotd-imu/v1",
+        "publisher_id": publisher_id,
         "sequence": sequence,
         "monotonic_ns": time.monotonic_ns(),
         "gyro_rad_s": list(snapshot["gyro_rad_s"]),
         "gravity": list(snapshot["gravity"]),
         "quaternion_wxyz": list(snapshot["quaternion_wxyz"]),
-        "ready": (bool(snapshot.get("calibrated"))
-                  and isinstance(age_ms, (int, float)) and 0 <= age_ms <= 100),
+        "ready": (isinstance(age_ms, (int, float)) and 0 <= age_ms <= 100),
         "stale": {"total": 0, "consecutive": 0},
         "driver": {
             "id": identity.get("loaded") or "zelux.imu.unknown",
@@ -45,6 +47,7 @@ class ImuPublisher:
         self.path = str(path)
         self.period = 1.0 / max(1, hz)
         self._sequence = 0
+        self._publisher_id = uuid.uuid4().hex
         self._task: asyncio.Task | None = None
         self._socket: socket.socket | None = None
 
@@ -70,7 +73,8 @@ class ImuPublisher:
         while True:
             started = time.monotonic()
             report = getattr(self.hal, "driver_report", {}).get("imu", {})
-            message = packet(self.hal.snapshot_imu() or {}, self._sequence, report)
+            message = packet(self.hal.snapshot_imu() or {}, self._sequence, report,
+                             self._publisher_id)
             if message is not None and self._socket is not None:
                 try:
                     self._socket.sendto(
