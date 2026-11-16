@@ -96,9 +96,18 @@ class RadxaHal(Hal):
             if self._factory is None:
                 raise ImportError("独立驱动包未安装")
             part = self._factory(wanted, *args, **kwargs)
-            version = driver_descriptor(wanted).version if driver_descriptor else None
+            # Metadata lookup is not construction: an injected/third-party factory
+            # may provide a valid implementation outside the package catalog.
+            version = None
+            metadata_error = None
+            if driver_descriptor is not None:
+                try:
+                    version = driver_descriptor(wanted).version
+                except Exception as exc:
+                    metadata_error = str(exc)
+                    self.log.warning("%s driver %s metadata unavailable: %s", kind, wanted, exc)
             self.driver_report[kind] = {"requested": self._selection.get(kind, wanted), "loaded": wanted,
-                                        "version": version,
+                                        "version": version, "metadata_error": metadata_error,
                                         "fallback": force_default, "error": None}
             return part
         except Exception as exc:

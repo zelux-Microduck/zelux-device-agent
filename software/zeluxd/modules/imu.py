@@ -18,7 +18,9 @@ import time
 from pathlib import Path
 
 from ..errors import ZeluxError, denied, unsupported
+from ..imu_mount_calibration import MountCalibration
 from ..hal.radxa_imu import wrap180
+from ..robotd_imu import RobotdImu
 from .base import BaseModule
 
 # 五步向导：key / 页面标题 / 提示。key 与前端一致，改名要同步改前端。
@@ -56,6 +58,8 @@ class Module(BaseModule):
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self.params = dict(PARAMS)
+        self.robotd = RobotdImu(self.config)
+        self.mount_calibration = MountCalibration()
         self._running = False
         self._step = 0
         self._buf: list[tuple[float, float]] = []      # 当前步的 (roll, pitch)
@@ -64,10 +68,25 @@ class Module(BaseModule):
         self._result: dict | None = None
         self._started = 0.0
         self._calib: dict = self._load_calib()
+        self._mount_calibration_revision: str | None = None
+
+    async def start(self) -> None:
+        if self.config.mode == "radxa":
+            self.spawn(self._poll_robotd())
+
+    async def _poll_robotd(self) -> None:
+        while True:
+            await self.robotd.refresh()
+            await asyncio.sleep(2)
 
     # ---------------- 状态 ----------------
     def state(self) -> dict:
-        snap = dict(self.hal.snapshot_imu() or {})
+        management = self._management_view()
+        managed = management["calibration"] != "agent"
+        snap = ({"ok": False, "measurement_source": "robotd",
+                 "reason": "robotd 管理的总线 IMU 不使用 Agent I2C 姿态或标定",
+                 "chip": (management.get("runtime") or {}).get("model")}
+                if managed else dict(self.hal.snapshot_imu() or {}))
         snap.setdefault("ok", False)
         # 模拟 HAL 不会自己应用标定：这里补一层显示修正，
         # 免得演示时出现"显示已校准、鸭子还歪着"这种自相矛盾的画面。
@@ -78,8 +97,16 @@ class Module(BaseModule):
             snap["pitch"] = round(wrap180(float(snap.get("pitch", 0.0))
                                           * self._calib.get("pitch_sign", 1)
                                           + self._calib.get("pitch_offset", 0.0)), 2)
+        snap["management"] = management
+        snap["calibrated"] = management.get("mount_calibration", {}).get("status") == "applied" if managed else bool(self._calib)
         snap["wizard"] = self._view()
+        snap["wizard"]["enabled"] = not managed
         return {"imu": snap}
+
+    def _management_view(self) -> dict:
+        view = self.robotd.view()
+        view["mount_calibration_wizard"] = self.mount_calibration.view()
+        return view
 
     def _calib_file(self) -> Path:
         return Path(self.config.state_dir) / "imu_calib.json"
@@ -127,6 +154,58 @@ class Module(BaseModule):
         if op == "op":
             # 契约是 `imu.op` + `{op:"start"}`：动作名在 args 里，别把它当未知命令
             op = str(args.get("op", ""))
+        if op == "management_status":
+            await self.robotd.refresh()
+            return {"management": self._management_view()}
+        if op == "model_select":
+            result = await self.robotd.select(args.get("model"), args.get("expected"))
+            self._reset()
+            self.mount_calibration.clear()
+            self._mount_calibration_revision = None
+            result["management"] = self._management_view()
+            return result
+        if op == "model_restart":
+            result = await self.robotd.restart(args.get("expected"), args.get("confirm"), args.get("mechanically_supported"))
+            result["management"] = self._management_view()
+            return result
+        if op == "mount_calibration_start":
+            return await self._mount_calibration_start(args)
+        if op == "mount_calibration_capture":
+            if not self.mount_calibration.view()["running"]:
+                raise denied("请先开始机体对齐标定，再按顺序采集姿态")
+            sample = await self.robotd.capture_gravity()
+            if self.robotd.view().get("catalog", {}).get("revision") != self._mount_calibration_revision:
+                self.mount_calibration.clear()
+                self._mount_calibration_revision = None
+                raise ZeluxError("标定期间 IMU 配置发生变化；本次采集已清除，请刷新后重新开始", "conflict")
+            try:
+                self.mount_calibration.capture(sample)
+            except ValueError as exc:
+                raise denied(str(exc)) from exc
+            return {"ok": True, "sample": sample, "management": self._management_view()}
+        if op == "mount_calibration_solve":
+            try:
+                result = self.mount_calibration.solve()
+            except ValueError as exc:
+                raise denied(str(exc)) from exc
+            return {"ok": True, "result": result, "management": self._management_view()}
+        if op == "mount_calibration_commit":
+            result = self.mount_calibration.result
+            if not result:
+                raise denied("请先完成采集并解算机体对齐")
+            if args.get("expected") != self._mount_calibration_revision:
+                raise ZeluxError("标定期间 IMU 配置发生变化；请刷新并重新标定", "conflict")
+            saved = await self.robotd.save_mount_correction(
+                result["correction_wxyz"], args.get("expected"))
+            self._mount_calibration_revision = None
+            saved["management"] = self._management_view()
+            return saved
+        if op == "mount_calibration_clear":
+            self.mount_calibration.clear()
+            self._mount_calibration_revision = None
+            return {"ok": True, "management": self._management_view()}
+        if op in ("start", "solve", "commit", "bias", "sample") and self.robotd.view()["calibration"] != "agent":
+            raise denied("此 IMU 由 robotd 管理，禁止使用 Agent I2C 标定或采样；固定安装方向按型号自动应用")
         if op == "start":
             return await self._start(args)
         if op == "stop":
@@ -138,7 +217,7 @@ class Module(BaseModule):
         if op == "sim_tilt":
             return await self._sim_tilt(args)
         if op in ("status", ""):
-            return {"ok": True, "wizard": self._view(), "imu": self.hal.snapshot_imu()}
+            return {"ok": True, "wizard": self._view(), "imu": self.state()["imu"]}
         if op == "sample":
             return {"imu": self.hal.snapshot_imu(), "recent": self._recent(args)}
         if op == "clear":
@@ -147,6 +226,30 @@ class Module(BaseModule):
         if op == "bias":
             return await self._bias(args)
         raise unsupported(f"imu 不支持 {op}")
+
+    async def _mount_calibration_start(self, args: dict) -> dict:
+        await self.robotd.refresh()
+        view = self.robotd.view()
+        config = view.get("catalog", {}).get("config", {}).get("imu", {})
+        runtime = view.get("runtime") or {}
+        models = view.get("catalog", {}).get("models", [])
+        selected = next((item for item in models if item.get("id") == config.get("model")), {})
+        if args.get("confirm") is not True or args.get("mechanically_supported") is not True:
+            raise denied("请确认已停止动作、托稳机体并安排现场看护")
+        if (not view.get("available") or view.get("simulated") or not view.get("ready")
+                or not view.get("restart_safe") or view.get("pending_restart") is not False):
+            raise ZeluxError("robotd/IMU 未就绪或当前不允许开始标定", "busy")
+        if (config.get("source") != "imu-dxl" or selected.get("calibration_supported") is not True
+                or runtime.get("source") != "imu-dxl" or runtime.get("model") != config.get("model")):
+            raise denied("当前 robotd 型号目录未开放此 IMU 的机体对齐标定")
+        existing = view.get("mount_calibration", {}).get("correction_wxyz")
+        revision = view.get("catalog", {}).get("revision")
+        self._mount_calibration_revision = revision
+        return {"ok": True, "management": self._management_view_with_wizard_start(existing)}
+
+    def _management_view_with_wizard_start(self, existing_correction=None) -> dict:
+        self.mount_calibration.start(existing_correction)
+        return self._management_view()
 
     async def _start(self, args: dict) -> dict:
         if not (self.hal.snapshot_imu() or {}).get("ok"):
@@ -171,6 +274,9 @@ class Module(BaseModule):
     async def _loop(self) -> None:
         # 20 ms 轮一次缓存就够了：HAL 自己是 100 Hz 采样，这里只是"看"它的最新值
         while self._running:
+            if self.robotd.view()["calibration"] != "agent":
+                self._reset()
+                break
             snap = self.hal.snapshot_imu() or {}
             if snap.get("ok"):
                 self._feed(float(snap.get("roll", 0.0)), float(snap.get("pitch", 0.0)))

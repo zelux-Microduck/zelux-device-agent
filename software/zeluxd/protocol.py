@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 
 
-PROTOCOL_VERSION = "1.1.0"
+PROTOCOL_VERSION = "1.4.0"
 PROTOCOL_SUPPORTED = ">=1.0.0 <2.0.0"
 DRIVER_API_VERSION = "1.0.0"
 DRIVER_API_SUPPORTED = ">=1.0.0 <2.0.0"

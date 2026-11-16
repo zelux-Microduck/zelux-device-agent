@@ -46,6 +46,9 @@ class Config:
         self.i2c_bus = int(os.environ.get("ZELUX_I2C_BUS", "3"))
         self.tof_addr = int(os.environ.get("ZELUX_TOF_ADDR", "0x52"), 16)
         self.fan_socket = os.environ.get("ZELUX_FAN_SOCK", "/run/zelux/fan.sock")
+        self.robotctl = os.environ.get("ZELUX_ROBOTCTL", "/opt/robot/daemon/current/bin/robotctl")
+        self.robotd_config = Path(os.environ.get("ZELUX_ROBOTD_CONFIG", "/etc/robot/robotd.toml"))
+        self.robotd_socket = Path(os.environ.get("ZELUX_ROBOTD_SOCKET", "/run/robotd.sock"))
         self.robotd_imu_socket = os.environ.get(
             "ZELUX_ROBOTD_IMU_SOCK", "/run/zelux/robotd-imu.sock")
         self.robotd_imu_publish = _flag("ZELUX_ROBOTD_IMU_PUBLISH", self.mode == "radxa")

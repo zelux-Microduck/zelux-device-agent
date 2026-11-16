@@ -440,7 +440,9 @@ class RadxaFan:
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
-        await self._probe()
+        # _probe 是同步方法：这里 await 它会抛 "object NoneType can't be used in
+        # 'await' expression"，风扇永远起不来（真机日志里就是这句）
+        self._probe()
         if self._task is None or self._task.done():
             self._closing = False
             self._task = asyncio.create_task(self._rpm_loop(), name="fan-rpm")

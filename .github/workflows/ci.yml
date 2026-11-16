@@ -16,6 +16,8 @@ jobs:
           python -m zeluxd.tests.test_protocol_drivers
           python -m zeluxd.tests.test_hal_selection
           python -m zeluxd.tests.test_hardware_config
+          python -m unittest zeluxd.tests.test_robotd_imu_management zeluxd.tests.test_robotd_imu_process -v
+          python -m zeluxd.tests.test_imu_mount_calibration
           python -m zeluxd.tests.test_firmware
           python -m zeluxd.tests.test_servo_proto
           python -m zeluxd.tests.test_avoid

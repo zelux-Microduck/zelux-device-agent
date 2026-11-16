@@ -96,6 +96,11 @@ class Module(BaseModule):
     def _ensure_loop(self) -> None:
         if self._control != "hal":
             return                    # 没有真实控制器就别空转，省电省日志
+        # 控制器自己说不可用（没有 PWM 通道 / 根助手没起来）时不要起循环：
+        # 每 2 秒一次的下发只会把警告刷满日志，页面反正显示 available:false
+        available, _reason, _hint = self._availability()
+        if not available:
+            return
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._auto_loop(), name="fan-auto")
 
