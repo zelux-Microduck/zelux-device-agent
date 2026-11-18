@@ -153,7 +153,7 @@ RADXA_DRIVERS = (
     DriverDescriptor("zelux.camera.v4l2-libcamera", "V4L2 / libcamera", "1.1.0", "camera",
                      models=("UVC", "V4L2", "libcamera"),
                      capabilities={"snapshot": True, "stream": True, "firmware": False}),
-    DriverDescriptor("zelux.fan.radxa-zero3w-dual-pwm", "Radxa 双路 PWM 风扇", "1.1.0", "fan",
+    DriverDescriptor("zelux.fan.radxa-pwm", "Radxa PWM 风扇", "1.1.0", "fan",
                      models=("Zero 3W dual PWM fan",),
                      capabilities={"channels": 2, "pwm": True, "tach": [False, True]}),
     DriverDescriptor("zelux.imu.multi-i2c", "QMI8658/MPU6050/ICM42688", "1.1.0", "imu",

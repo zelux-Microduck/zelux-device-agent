@@ -1,4 +1,4 @@
-"""风扇页（`name = "fan"`）：两路 PWM 调速 + 主板那颗的转速表 + 温控曲线。
+"""风扇 Studio API：实例清单与风扇控制都由 root fanctl 服务提供。
 
 为什么页面上要同时有"自动曲线"和"手动百分比"：
 调机时人手要知道"现在到底转多少"，而跑起来以后没人想看第二眼。所以默认 auto
@@ -11,15 +11,9 @@
 """
 from __future__ import annotations
 
-import asyncio
-
 from ..errors import ZeluxError
-from ..hal.radxa_fan import (DEFAULT_PCT, FanUnavailable, clamp_pct, curve_pct,
-                             normalize_curve)
+from ..hal.radxa_fan import DEFAULT_PCT, FanUnavailable, clamp_pct, normalize_curve
 from .base import BaseModule
-
-AUTO_HZ = 0.5            # 曲线 2 秒判一次就够：温度惯性比这慢得多
-
 
 class Module(BaseModule):
     name = "fan"
@@ -35,9 +29,8 @@ class Module(BaseModule):
         self._driver = getattr(self.hal, "fan", None)
         self._set = getattr(self.hal, "fan_set", None)
         self._read = getattr(self.hal, "fan_read", None)
-        self._control = "hal" if (self._set or self._driver) else "none"
+        self._control = "service" if self._driver else ("hal" if self._set else "none")
         self._last_pct: int | None = None
-        self._task: asyncio.Task | None = None
 
     # ---------------- 状态 ----------------
     def state(self) -> dict:
@@ -55,8 +48,8 @@ class Module(BaseModule):
 
         available, reason, hint = self._availability()
         snap.update({
-            "mode": self.mode,
-            "curve": [list(r) for r in self.curve],
+            "mode": snap.get("mode", self.mode) if self._driver else self.mode,
+            "curve": snap.get("curve", self.curve) if self._driver else [list(r) for r in self.curve],
             "temp": temp if temp is not None else snap.get("temp"),
             "items": items,
             "available": available,
@@ -65,7 +58,8 @@ class Module(BaseModule):
             "virtual": virtual,
             "source": getattr(self._driver, "source", None) or ("hal" if self._control == "hal" else "none"),
             "pct": self._last_pct if self._last_pct is not None else snap.get("pct", DEFAULT_PCT),
-            "pin_config": {"channels": [dict(item) for item in getattr(self.config, "fan_channels", [])],
+            "pin_config": {"instances": [dict(item) for item in
+                                           ((snap.get("inventory") or {}).get("instances") or [])],
                            "restart_required": False},
         })
         return {"fan": snap}
@@ -85,38 +79,17 @@ class Module(BaseModule):
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
-        if self.mode == "manual":
-            return
-        self._ensure_loop()
+        if self._driver is not None and hasattr(self._driver, "start"):
+            await self._driver.start()
+            snap = self.state()["fan"]
+            self.mode = snap.get("mode", self.mode)
+            self.curve = normalize_curve(snap.get("curve"))
 
     async def stop(self) -> None:
         await super().stop()
-        self._task = None
-
-    def _ensure_loop(self) -> None:
-        if self._control != "hal":
-            return                    # 没有真实控制器就别空转，省电省日志
-        # 控制器自己说不可用（没有 PWM 通道 / 根助手没起来）时不要起循环：
-        # 每 2 秒一次的下发只会把警告刷满日志，页面反正显示 available:false
-        available, _reason, _hint = self._availability()
-        if not available:
-            return
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._auto_loop(), name="fan-auto")
-
-    async def _auto_loop(self) -> None:
-        while self.mode == "auto":
-            try:
-                temp = self.hal.snapshot_temp()
-                pct = curve_pct(temp, self.curve)
-                if pct != self._last_pct or self._last_pct is None:
-                    # 只在档位变化时写 PWM：sysfs 每次写都要走一遍内核，没必要 2 秒敲一次
-                    await self._apply_all(pct)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.log.warning("温控循环出错：%s", exc)
-            await asyncio.sleep(1.0 / AUTO_HZ)
+        if self._driver is not None and hasattr(self._driver, "stop"):
+            await self._driver.stop()
+        # Fan Agent has no PWM or temperature loop; zelux-fan owns both.
 
     # ---------------- 命令 ----------------
     async def cmd(self, op: str, args: dict) -> dict:
@@ -131,9 +104,25 @@ class Module(BaseModule):
         if op == "manual":
             return await self._set_mode("manual", args)
         if op == "curve":
-            return self._set_curve(args)
+            return await self._set_curve(args)
         if op in ("pin_config", "pins"):
-            return self._set_pin_config(args)
+            return await self._set_pin_config(args)
+        if op == "instance_create":
+            return await self._instance_create(args)
+        if op == "instance_update":
+            return await self._instance_update(args)
+        if op == "instance_delete":
+            return await self._instance_delete(args)
+        if op in ("instance_enable", "instance_disable"):
+            driver = self._require_instance_driver("set_enabled")
+            identifier = args.get("instance_id")
+            if not isinstance(identifier, str) or not identifier:
+                raise ZeluxError("instance_id 参数不能为空", "denied")
+            try:
+                result = await driver.set_enabled(identifier, op == "instance_enable")
+            except FanUnavailable as exc:
+                raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+            return {"ok": True, "result": result, "fan": self.state()["fan"]}
         if op in ("self_test", "selftest", "test"):
             return await self._self_test(args)
         if op == "read":
@@ -143,60 +132,132 @@ class Module(BaseModule):
         raise ZeluxError(f"fan 不支持 {op}（可用：auto/manual/curve/read/self_test/status）",
                          "unsupported")
 
-    def _set_pin_config(self, args: dict) -> dict:
-        channels = args.get("channels")
-        if not isinstance(channels, list) or len(channels) != 2:
-            raise ZeluxError("风扇引脚必须包含两路配置", "denied")
-        out = []
-        for index, item in enumerate(channels):
-            if not isinstance(item, dict):
-                raise ZeluxError(f"第 {index} 路配置格式错误", "denied")
-            try:
-                pwm, gpio = int(item["pwm"]), int(item["gpio"])
-                tach = None if item.get("tach") in (None, "") else int(item["tach"])
-            except (KeyError, TypeError, ValueError):
-                raise ZeluxError(f"第 {index} 路 PWM/GPIO/Tach 必须是整数", "denied") from None
-            if not (0 <= pwm <= 255 and 0 <= gpio <= 1023 and (tach is None or 0 <= tach <= 1023)):
-                raise ZeluxError(f"第 {index} 路引脚超出允许范围", "denied")
-            out.append({"name": str(item.get("name") or f"风扇 {index + 1}")[:32], "pwm": pwm,
-                        "gpio": gpio, "pin": str(item.get("pin") or "")[:64], "tach": tach})
-        self.config.save_hardware("fan", {"channels": out})
-        return {"ok": True, "channels": out, "restart_required": True,
-                "note": "配置已保存，重启后重新初始化 PWM 和 Tach"}
+    async def _set_pin_config(self, args: dict) -> dict:
+        """Deprecated: use instance_create/update/delete instead."""
+        raise ZeluxError(
+            "pin_config 已废弃，请使用 instance_create/instance_update/instance_delete",
+            "unsupported"
+        )
+
+    def _require_instance_driver(self, method: str | None = None):
+        """Return driver or raise ZeluxError if unavailable or method not callable.
+
+        Args:
+            method: Optional method name to check for callability (e.g., 'create_instance')
+
+        Returns:
+            The driver object if available and method is callable (if specified)
+
+        Raises:
+            ZeluxError: If driver is None or method is not callable
+        """
+        if self._driver is None:
+            raise ZeluxError("当前没有可管理风扇实例的 fanctl 服务", "unavailable")
+        if method is not None:
+            if not hasattr(self._driver, method):
+                raise ZeluxError(
+                    f"当前 fanctl 驱动不支持 {method} 操作",
+                    "unsupported"
+                )
+            if not callable(getattr(self._driver, method)):
+                raise ZeluxError(
+                    f"当前 fanctl 驱动的 {method} 不可调用",
+                    "unsupported"
+                )
+        return self._driver
+
+    async def _instance_create(self, args: dict) -> dict:
+        driver = self._require_instance_driver("create_instance")
+        instance = args.get("instance")
+        if not isinstance(instance, dict):
+            raise ZeluxError("instance 参数必须是字典", "denied")
+        if not instance:
+            raise ZeluxError("instance 参数不能为空", "denied")
+        instance_id = instance.get("id")
+        if not instance_id:
+            raise ZeluxError("instance 必须包含有效的 id", "denied")
+        try:
+            result = await driver.create_instance(instance)
+        except FanUnavailable as exc:
+            raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+        return {"ok": True, "result": result, "fan": self.state()["fan"]}
+
+    async def _instance_update(self, args: dict) -> dict:
+        driver = self._require_instance_driver("update_instance")
+        instance_id = args.get("instance_id")
+        if not instance_id:
+            raise ZeluxError("instance_id 参数不能为空", "denied")
+        instance = args.get("instance")
+        if not isinstance(instance, dict):
+            raise ZeluxError("instance 参数必须是字典", "denied")
+        if not instance:
+            raise ZeluxError("instance 参数不能为空", "denied")
+        instance_body_id = instance.get("id")
+        if not instance_body_id:
+            raise ZeluxError("instance 必须包含 id 字段", "denied")
+        if str(instance_body_id) != str(instance_id):
+            raise ZeluxError(
+                f"instance_id({instance_id}) 与 instance.id({instance_body_id}) 不匹配",
+                "denied"
+            )
+        try:
+            result = await driver.update_instance(str(instance_id), instance)
+        except FanUnavailable as exc:
+            raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+        return {"ok": True, "result": result, "fan": self.state()["fan"]}
+
+    async def _instance_delete(self, args: dict) -> dict:
+        driver = self._require_instance_driver("delete_instance")
+        instance_id = args.get("instance_id")
+        if not instance_id:
+            raise ZeluxError("instance_id 参数不能为空", "denied")
+        if args.get("confirm") is not True:
+            raise ZeluxError("删除风扇会停止并释放该实例，请先确认", "denied")
+        try:
+            result = await driver.delete_instance(str(instance_id))
+        except FanUnavailable as exc:
+            raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+        return {"ok": True, "result": result, "fan": self.state()["fan"]}
 
     async def _set_mode(self, mode: str, args: dict) -> dict:
         if mode == "auto":
+            if self._driver is not None and hasattr(self._driver, "set_auto"):
+                try:
+                    result = await self._driver.set_auto()
+                except FanUnavailable as exc:
+                    raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+                self.mode = "auto"
+                return {"ok": True, **result, "fan": self.state()["fan"]}
             self.mode = "auto"
-            self._save()
-            self._ensure_loop()
-            temp = self.hal.snapshot_temp()
-            pct = curve_pct(temp, self.curve)
-            applied = await self._apply_all(pct)
-            return {"ok": True, "mode": "auto", "pct": pct, "temp": temp,
-                    "applied": applied, **self._avail_note()}
+            return {"ok": True, "mode": "auto", "virtual": self._control == "none"}
 
-        index = int(args.get("index", 0) or 0)
+        target = args.get("instance_id", args.get("index", 0))
         if args.get("pct") is None:
             raise ZeluxError("手动档要给 pct（0–100）", "denied")
         pct = clamp_pct(args.get("pct"))
-        self.mode = "manual"
-        self._task = None             # 曲线循环见到 mode 变了会自己退出
-        self._save()
-        result = await self._apply(index, pct)
+        self.mode = "auto" if self._driver else "manual"
+        result = await self._apply(target, pct)
         if result.get("ok"):
-            self.log_event(f"风扇 {index} 手动 {pct}%（{result.get('source', '?')}）")
-        return {"ok": bool(result.get("ok")), "mode": "manual", "index": index, "pct": pct,
+            self.log_event(f"风扇 {target} 手动 {pct}%（{result.get('source', '?')}）")
+        if not result.get("ok"):
+            raise ZeluxError(result.get("reason") or "风扇调速失败", result.get("code", "hardware"))
+        return {"ok": True, "mode": self.mode, "instance_mode": "manual", "instance_id": target, "pct": pct,
                 "detail": result, **self._avail_note()}
 
-    def _set_curve(self, args: dict) -> dict:
+    async def _set_curve(self, args: dict) -> dict:
         self.curve = normalize_curve(args.get("curve"))
-        self._save()
+        if self._driver is not None and hasattr(self._driver, "set_curve"):
+            try:
+                result = await self._driver.set_curve(self.curve)
+            except FanUnavailable as exc:
+                raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+        else:
+            result = {"ok": self._control == "none", "virtual": True}
         self.log_event("温控曲线已更新：" + "、".join(f"{t}℃→{p}%" for t, p in self.curve))
-        return {"ok": True, "curve": [list(r) for r in self.curve], "mode": self.mode,
-                "note": "阶梯判据是 temp ≥ 台阶温度；都不满足时走 60%"}
+        return {**result, "curve": [list(r) for r in self.curve], "mode": self.mode}
 
     async def _read_one(self, args: dict) -> dict:
-        index = int(args.get("index", 1) or 0)
+        index = args.get("instance_id", args.get("index", 0))
         if self._driver is not None and hasattr(self._driver, "read"):
             return {"ok": True, "item": await self._driver.read(index)}
         if self._read:
@@ -210,7 +271,7 @@ class Module(BaseModule):
         """全速 1 秒看 rpm 是不是 > 300——这是"风扇到底转没转"唯一靠谱的判据。"""
         if self._driver is not None and hasattr(self._driver, "self_test"):
             try:
-                res = await self._driver.self_test(args.get("index"))
+                res = await self._driver.self_test(args.get("instance_id", args.get("index")))
             except FanUnavailable as exc:
                 raise ZeluxError(exc.message, "denied") from None
             self.log_event("风扇自检：" + ("通过" if res.get("ok") else "有问题，看详情"))
@@ -220,7 +281,7 @@ class Module(BaseModule):
                 "hint": "真机上启用 zelux-fand 后，自检会全速 1 秒读 tach 判断是否真的在转"}
 
     # ---------------- 下发 ----------------
-    async def _apply(self, index: int, pct: int) -> dict:
+    async def _apply(self, index: Any, pct: int) -> dict:
         if self._control == "none":
             self._manual[index] = clamp_pct(pct)
             self._last_pct = self._manual[index]
@@ -243,15 +304,9 @@ class Module(BaseModule):
         return res if isinstance(res, dict) else {"ok": bool(res), "pct": clamp_pct(pct)}
 
     async def _apply_all(self, pct: int) -> list:
-        count = len(self.state()["fan"]["items"]) or 1
-        return [await self._apply(i, pct) for i in range(count)]
+        items = self.state()["fan"]["items"]
+        return [await self._apply(item.get("id", i), pct) for i, item in enumerate(items)]
 
     def _avail_note(self) -> dict:
         available, reason, hint = self._availability()
         return {} if available else {"available": False, "reason": reason, "hint": hint}
-
-    def _save(self) -> None:
-        try:
-            self.save_store({"curve": [list(r) for r in self.curve], "mode": self.mode})
-        except OSError as exc:
-            self.log.warning("风扇配置没存下来：%s", exc)

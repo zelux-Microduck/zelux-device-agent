@@ -10,7 +10,7 @@ _DRIVER_ID_ALIASES = {
     "zelux.servo.feetech-sts3215": "zelux.servo.feetech-sts-scs",
     "zelux.tof.vl53l5cx": "zelux.tof.st-vl53l5cx",
     "zelux.camera.v4l2": "zelux.camera.v4l2-libcamera",
-    "zelux.fan.radxa-pwm": "zelux.fan.radxa-zero3w-dual-pwm",
+    "zelux.fan.radxa-zero3w-dual-pwm": "zelux.fan.radxa-pwm",
     "zelux.imu.qmi8658-compatible": "zelux.imu.multi-i2c",
 }
 

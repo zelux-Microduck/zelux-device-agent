@@ -4,7 +4,7 @@
 * `radxa_servo.RadxaServo` —— 15 颗总线舵机（/dev/ttyS2 @ 1 Mbps）
 * `radxa_imu.RadxaIMU`     —— I²C 外部 IMU（QMI8658 / MPU6050 / ICM42688 自动探测）
 * `radxa_tof.RadxaTof`     —— VL53L5CX 8×8（I²C-3 / 0x52）
-* `radxa_fan.RadxaFan`     —— 双路 PWM + tach（经 root 助手 /run/zelux/fan.sock）
+* `radxa_fan.RadxaFan`     —— fanctl socket 客户端（root 服务独占 PWM/GPIO）
 
 "拼"这件事本身有风险，所以：
 1. 任何一块起不来都只降级那一块，不许拉着整机崩；
@@ -48,7 +48,7 @@ DEFAULT_DRIVER_IDS = {
     "servo": "zelux.servo.feetech-sts-scs",
     "tof": "zelux.tof.st-vl53l5cx",
     "camera": "zelux.camera.v4l2-libcamera",
-    "fan": "zelux.fan.radxa-zero3w-dual-pwm",
+    "fan": "zelux.fan.radxa-pwm",
     "imu": "zelux.imu.multi-i2c",
 }
 
