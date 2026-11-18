@@ -9,6 +9,9 @@ from pathlib import Path
 
 from .errors import ZeluxError
 
+RESTART_CONFIRM_TIMEOUT = 25
+RESTART_POLL_INTERVAL = 0.5
+
 
 class RobotdImu:
     def __init__(self, config, runner=None):
@@ -28,7 +31,7 @@ class RobotdImu:
         except OSError as exc:
             raise ZeluxError(f"无法执行 robotd 管理工具，请检查安装与权限：{exc}", "unavailable") from exc
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), 20 if args[0] == "systemctl" else 4)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 4)
         except BaseException as exc:
             if process.returncode is None:
                 process.kill()
@@ -38,8 +41,6 @@ class RobotdImu:
             raise
         if process.returncode:
             raise ZeluxError(stderr.decode(errors="replace")[:1000] or "robotd 管理操作失败", "unavailable")
-        if args[0] == "systemctl":
-            return {}
         try:
             return json.loads(stdout)
         except (ValueError, UnicodeDecodeError) as exc:
@@ -273,13 +274,26 @@ class RobotdImu:
             instance = view["runtime"].get("instance_id")
             self._status, self._updated = None, None
             self._error = "正在重启；尚未验证新进程已加载配置"
-            await self._runner("systemctl", "--no-ask-password", "restart", "robotd.service")
-            # A successful service command is not proof of a healthy sensor.
-            try:
-                await self._read()
-            except Exception as exc:
-                self._status, self._updated = None, None
-                self._error = str(exc)
+            requested = await self._runner(
+                self.config.robotctl, "--robot-socket", str(self.config.robotd_socket),
+                "imu-restart", "--expected", expected)
+            if not isinstance(requested, dict) or requested.get("accepted") is not True:
+                raise ZeluxError("robotd 未确认重启请求", "unavailable")
+            # robotd queues the fixed systemd action after acknowledging this IPC call.
+            # Verify a new process and the expected config revision; the request alone is not proof.
+            deadline = time.monotonic() + RESTART_CONFIRM_TIMEOUT
+            while time.monotonic() < deadline:
+                await asyncio.sleep(min(RESTART_POLL_INTERVAL, max(0, deadline - time.monotonic())))
+                try:
+                    await self._read()
+                except Exception as exc:
+                    self._status, self._updated = None, None
+                    self._error = str(exc)
+                    continue
+                current_view = self.view()
+                if (current_view["runtime"]
+                        and current_view["runtime"].get("instance_id") != instance):
+                    break
             current = self.view()
             applied = bool(current["runtime"] and current["runtime"].get("instance_id") != instance
                            and current["pending_restart"] is False and not current["simulated"])

@@ -32,9 +32,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.calls.append(args)
         if self.failure:
             raise OSError("offline")
-        if args[0] == "systemctl":
+        if "imu-restart" in args:
             self.status["health"]["imu_runtime"].update(instance_id="two", revision=self.catalog["revision"], source="imu-dxl")
-            return {}
+            return {"accepted": True}
         if "imu-config" in args:
             if "--model" in args:
                 self.catalog["revision"] = "new"
@@ -47,7 +47,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         result = await self.bridge.select("qingmu-a1", "old")
         self.assertTrue(result["saved"])
         self.assertTrue(result["management"]["pending_restart"])
-        self.assertFalse(any(c[0] == "systemctl" for c in self.calls))
+        self.assertFalse(any("imu-restart" in c for c in self.calls))
         saved_call = next(c for c in self.calls if "--model" in c)
         self.assertEqual(saved_call[:3], ("robotctl", "--robot-socket", str(self.cfg.robotd_socket)))
 
@@ -66,6 +66,17 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["management"]["pending_restart"])
         call = next(c for c in self.calls if "--mount-correction-wxyz" in c)
         self.assertEqual(call[:3], ("robotctl", "--robot-socket", str(self.cfg.robotd_socket)))
+        self.assertFalse(any("imu-restart" in c for c in self.calls))
+
+    async def test_restart_is_delegated_to_robotd_not_systemctl(self):
+        await self.bridge.select("qingmu-a1", "old")
+        with patch("zeluxd.robotd_imu.RESTART_CONFIRM_TIMEOUT", 0.01), \
+                patch("zeluxd.robotd_imu.RESTART_POLL_INTERVAL", 0.001):
+            result = await self.bridge.restart("new", True, True)
+        self.assertTrue(result["applied"])
+        call = next(c for c in self.calls if "imu-restart" in c)
+        self.assertEqual(call[:3], ("robotctl", "--robot-socket", str(self.cfg.robotd_socket)))
+        self.assertIn("--expected", call)
         self.assertFalse(any(c[0] == "systemctl" for c in self.calls))
 
     async def test_unverified_and_unknown_models_never_reach_writer(self):
@@ -119,11 +130,13 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.status["restart"]["safe"] = False
         with self.assertRaises(ZeluxError):
             await self.bridge.restart("new", True, True)
-        self.assertFalse(any(c[0] == "systemctl" for c in self.calls))
+        self.assertFalse(any("imu-restart" in c for c in self.calls))
 
     async def test_restart_confirms_new_process_and_revision_not_just_command(self):
         await self.bridge.select("qingmu-a1", "old")
-        result = await self.bridge.restart("new", True, True)
+        with patch("zeluxd.robotd_imu.RESTART_CONFIRM_TIMEOUT", 0.01), \
+                patch("zeluxd.robotd_imu.RESTART_POLL_INTERVAL", 0.001):
+            result = await self.bridge.restart("new", True, True)
         self.assertTrue(result["applied"])
         self.assertFalse(result["management"]["pending_restart"])
         self.assertEqual(result["management"]["calibration"], "robotd-managed")
@@ -131,7 +144,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_restart_mismatch_revision_refused(self):
         with self.assertRaises(ZeluxError):
             await self.bridge.restart("stale", True, True)
-        self.assertFalse(any(c[0] == "systemctl" for c in self.calls))
+        self.assertFalse(any("imu-restart" in c for c in self.calls))
 
     async def test_missing_instance_never_confirms_runtime(self):
         self.status["health"]["imu_runtime"].pop("instance_id")
@@ -141,9 +154,13 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.select("qingmu-a1", "old")
         original = self.bridge._runner
         async def no_new_instance(*args):
-            return {} if args[0] == "systemctl" else await original(*args)
+            if "imu-restart" in args:
+                return {"accepted": True}
+            return await original(*args)
         self.bridge._runner = no_new_instance
-        result = await self.bridge.restart("new", True, True)
+        with patch("zeluxd.robotd_imu.RESTART_CONFIRM_TIMEOUT", 0.01), \
+                patch("zeluxd.robotd_imu.RESTART_POLL_INTERVAL", 0.001):
+            result = await self.bridge.restart("new", True, True)
         self.assertFalse(result["applied"])
         self.assertTrue(result["management"]["pending_restart"])
 
@@ -152,7 +169,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         original = self.bridge._runner
         async def wrong_revision(*args):
             result = await original(*args)
-            if args[0] == "systemctl":
+            if "imu-restart" in args:
                 self.status["health"]["imu_runtime"]["revision"] = "wrong"
             return result
         self.bridge._runner = wrong_revision
