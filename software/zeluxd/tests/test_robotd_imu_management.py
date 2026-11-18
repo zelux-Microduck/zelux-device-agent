@@ -48,6 +48,25 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["saved"])
         self.assertTrue(result["management"]["pending_restart"])
         self.assertFalse(any(c[0] == "systemctl" for c in self.calls))
+        saved_call = next(c for c in self.calls if "--model" in c)
+        self.assertEqual(saved_call[:3], ("robotctl", "--robot-socket", str(self.cfg.robotd_socket)))
+
+    async def test_mount_save_uses_robotd_socket_without_restart(self):
+        self.catalog["config"]["imu"] = {"source": "imu-dxl", "model": "qingmu-a1"}
+        self.status["health"]["imu_runtime"]["source"] = "imu-dxl"
+        original = self.bridge._runner
+        async def save(*args):
+            result = await original(*args)
+            if "--mount-correction-wxyz" in args:
+                result["revision"] = "corrected"
+            return result
+        self.bridge._runner = save
+        result = await self.bridge.save_mount_correction([1, 0, 0, 0], "old")
+        self.assertTrue(result["saved"])
+        self.assertTrue(result["management"]["pending_restart"])
+        call = next(c for c in self.calls if "--mount-correction-wxyz" in c)
+        self.assertEqual(call[:3], ("robotctl", "--robot-socket", str(self.cfg.robotd_socket)))
+        self.assertFalse(any(c[0] == "systemctl" for c in self.calls))
 
     async def test_unverified_and_unknown_models_never_reach_writer(self):
         for model in ["qingmu-b1", "bad", None]:

@@ -219,7 +219,8 @@ class RobotdImu:
                 raise ZeluxError("配置已改变，请刷新后重新保存标定", "conflict")
             raw = json.dumps(correction, separators=(",", ":"))
             saved = await self._runner(
-                self.config.robotctl, "imu-config", "--file", str(self.config.robotd_config),
+                self.config.robotctl, "--robot-socket", str(self.config.robotd_socket),
+                "imu-config", "--file", str(self.config.robotd_config),
                 "--mount-correction-wxyz", raw, "--expected", expected)
             if not isinstance(saved, dict) or saved.get("schema") != "zelux.robotd-imu-management/v1":
                 raise ZeluxError("robotctl 未确认标定配置保存结果，请刷新核对", "unavailable")
@@ -240,7 +241,8 @@ class RobotdImu:
                 choices = self._catalog.get("models", [])
                 if not any(m.get("id") == model and m.get("supported") is True and m.get("compatible") is True for m in choices):
                     raise ZeluxError("该型号未验证或与总线协议不兼容", "denied")
-                saved = await self._runner(self.config.robotctl, "imu-config", "--file", str(self.config.robotd_config),
+                saved = await self._runner(self.config.robotctl, "--robot-socket", str(self.config.robotd_socket),
+                                           "imu-config", "--file", str(self.config.robotd_config),
                                            "--model", model, "--expected", expected)
                 if not isinstance(saved, dict) or saved.get("schema") != "zelux.robotd-imu-management/v1":
                     raise ZeluxError("保存结果无效，配置可能已写入，请刷新核对", "unavailable")
