@@ -241,7 +241,8 @@ class DriverRegistry:
             if device_class == "fan":
                 return "ready" if self.hal.snapshot_fan().get("items") else "unavailable"
             if device_class == "imu":
-                return "ready" if self.hal.snapshot_imu().get("ok") else "unavailable"
+                snap = self.hal.snapshot_imu()
+                return "ready" if (snap.get("ok") or snap.get("device_ready")) else "unavailable"
             if device_class == "camera":
                 return "ready"  # 摄像头无阻塞式快照，具体可用性由 vision 模块报告
         except Exception:

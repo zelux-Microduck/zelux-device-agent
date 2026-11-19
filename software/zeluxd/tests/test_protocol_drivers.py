@@ -72,6 +72,14 @@ class DriverRegistryTests(unittest.TestCase):
         self.assertEqual(caps["tof"]["driver"], "zelux.sim.tof")
         self.assertEqual(caps["tof"]["health"], "ready")
 
+    def test_robotd_managed_imu_health_is_not_tied_to_agent_pose_stream(self):
+        class ManagedImuHal(_Hal):
+            def snapshot_imu(self):
+                return {"ok": False, "device_ready": True, "measurement_source": "robotd"}
+
+        registry = DriverRegistry("radxa", ManagedImuHal())
+        self.assertEqual(registry._health("imu"), "ready")
+
     def test_select_active_driver_is_idempotent_and_persisted(self):
         with TemporaryDirectory() as temp:
             registry = DriverRegistry("sim", _Hal(), state_dir=Path(temp), agent_version="1.0.0")

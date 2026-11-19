@@ -107,12 +107,12 @@ def solve_correction(samples, existing_correction=None):
         axes[key] = _unit(_cross(gravity, upright))
 
     # Expected right-handed body frame: forward pitch is +Y; left roll is -X.
-    measured_y = _unit([axes["forward"][i] - axes["back"][i] for i in range(3)])
-    measured_neg_x = _unit([axes["left"][i] - axes["right"][i] for i in range(3)])
     if _dot(axes["forward"], axes["back"]) > -0.75:
         raise ValueError("前倾与后倾没有形成相反方向，请按页面提示重新采集")
     if _dot(axes["left"], axes["right"]) > -0.75:
         raise ValueError("左倾与右倾没有形成相反方向，请按页面提示重新采集")
+    measured_y = _unit([axes["forward"][i] - axes["back"][i] for i in range(3)])
+    measured_neg_x = _unit([axes["left"][i] - axes["right"][i] for i in range(3)])
     orthogonality = abs(_dot(measured_y, measured_neg_x))
     if orthogonality > 0.35:
         raise ValueError("前后倾与左右倾的旋转轴不够正交，请保持机体沿单一方向倾斜后重采")

@@ -83,10 +83,35 @@ class Module(BaseModule):
     def state(self) -> dict:
         management = self._management_view()
         managed = management["calibration"] != "agent"
-        snap = ({"ok": False, "measurement_source": "robotd",
-                 "reason": "robotd 管理的总线 IMU 不使用 Agent I2C 姿态或标定",
-                 "chip": (management.get("runtime") or {}).get("model")}
-                if managed else dict(self.hal.snapshot_imu() or {}))
+        if managed:
+            # robotd-managed IMU is still a live device. Do not report it as
+            # unavailable merely because Agent must not open the shared bus or
+            # run the old local-I2C calibration path.
+            runtime = management.get("runtime") or {}
+            device_ready = bool(management.get("available")
+                                and not management.get("simulated")
+                                and (management.get("sensor") or {}).get("ready") is True)
+            snap = {
+                # `ok` continues to mean that Agent has live roll/pitch/yaw
+                # samples. robotd owns the shared-bus IMU, so expose its
+                # hardware health separately and never unlock the old I2C
+                # wizard from that health flag.
+                "ok": False,
+                "device_ready": device_ready,
+                "measurement_source": "robotd",
+                "source": runtime.get("source"),
+                "model": runtime.get("model"),
+                "chip": runtime.get("model"),
+                "driver_id": runtime.get("driver_id"),
+                "driver_version": runtime.get("driver_version"),
+            }
+            if not device_ready:
+                snap["device_reason"] = (management.get("error")
+                                         or ("robotd 正在仿真，不能代表真实 IMU"
+                                             if management.get("simulated")
+                                             else "robotd 暂未读到有效 IMU 数据"))
+        else:
+            snap = dict(self.hal.snapshot_imu() or {})
         snap.setdefault("ok", False)
         # 模拟 HAL 不会自己应用标定：这里补一层显示修正，
         # 免得演示时出现"显示已校准、鸭子还歪着"这种自相矛盾的画面。

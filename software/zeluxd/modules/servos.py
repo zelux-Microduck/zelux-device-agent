@@ -131,6 +131,19 @@ class Module(BaseModule):
         snap.setdefault("items", [])
         snap.setdefault("bus", "shared")
         snap["draft"] = self._draft_summary()
+        saved_items = self._calib.get("items") or {}
+        saved_ids = set()
+        for sid in saved_items:
+            try:
+                saved_ids.add(int(sid))
+            except (TypeError, ValueError):
+                continue
+        saved_count = len(saved_ids.intersection(JOINT_IDS))
+        snap["calibration"] = {
+            "saved_servos": saved_count,
+            "total_servos": len(JOINT_IDS),
+            "complete": saved_count == len(JOINT_IDS),
+        }
         return {"servos": snap, "servo_session": self._session_view()}
 
     def _session_view(self) -> dict | None:

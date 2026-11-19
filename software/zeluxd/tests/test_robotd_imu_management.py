@@ -177,7 +177,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_zero_ticks_not_ready(self):
         self.status["health"]["control_loop"]["ticks"] = 0
-        self.assertFalse((await self.bridge.refresh())["ready"])
+        view = await self.bridge.refresh()
+        self.assertFalse(view["ready"])
 
     async def test_sim_agent_does_not_write(self):
         self.cfg.mode = "sim"
@@ -191,12 +192,39 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         cfg = SimpleNamespace(**vars(self.cfg), state_dir=Path("/nonexistent-imu-test"))
         module = Module(SimpleNamespace(config=cfg, hal=hal))
         module.robotd = self.bridge
+        self.catalog["config"]["imu"] = {"source": "imu-dxl", "model": "qingmu-a1"}
+        self.status["health"]["imu_runtime"].update(source="imu-dxl", model="qingmu-a1",
+                                                        driver_id="zelux.imu.imu-dxl",
+                                                        driver_version="0.15.0")
+        await self.bridge.refresh()
+        state = module.state()["imu"]
+        self.assertFalse(state["ok"])
+        self.assertTrue(state["device_ready"])
+        self.assertEqual(state["source"], "imu-dxl")
+        self.assertEqual(state["model"], "qingmu-a1")
+        self.assertNotIn("roll", state)
+        self.assertFalse(state["calibrated"])
+        self.assertEqual(state["management"]["mount_calibration"]["status"], "not_calibrated")
         await self.bridge.select("qingmu-a1", "old")
-        self.assertFalse(module.state()["imu"]["ok"])
-        self.assertNotIn("roll", module.state()["imu"])
         for op in ["start", "commit", "bias", "sample", "solve"]:
             with self.assertRaises(ZeluxError):
                 await module.cmd(op, {})
+
+    async def test_robotd_managed_imu_not_ready_reports_device_reason(self):
+        from zeluxd.modules.imu import Module
+        hal = SimpleNamespace(snapshot_imu=lambda: {"ok": True, "roll": 99})
+        cfg = SimpleNamespace(**vars(self.cfg), state_dir=Path("/nonexistent-imu-test"))
+        module = Module(SimpleNamespace(config=cfg, hal=hal))
+        module.robotd = self.bridge
+        self.catalog["config"]["imu"] = {"source": "imu-dxl", "model": "qingmu-a1"}
+        self.status["health"]["imu_runtime"].update(source="imu-dxl", model="qingmu-a1")
+        self.status["health"]["imu"]["ready"] = False
+        await self.bridge.refresh()
+        state = module.state()["imu"]
+        self.assertFalse(state["ok"])
+        self.assertFalse(state["device_ready"])
+        self.assertIn("IMU", state["device_reason"])
+        self.assertNotIn("roll", state)
 
 
 if __name__ == "__main__":
