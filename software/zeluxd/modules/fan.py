@@ -119,6 +119,10 @@ class Module(BaseModule):
             return await self._set_curve(args)
         if op in ("pin_config", "pins"):
             return await self._set_pin_config(args)
+        if op in ("pwm_readiness", "hardware_readiness"):
+            return await self._pwm_readiness()
+        if op in ("pwm_setup_status", "pwm_setup_preview", "pwm_setup_apply", "pwm_setup_rollback"):
+            return await self._pwm_setup(op, args)
         if op == "instance_create":
             return await self._instance_create(args)
         if op == "instance_update":
@@ -130,6 +134,17 @@ class Module(BaseModule):
             identifier = args.get("instance_id")
             if not isinstance(identifier, str) or not identifier:
                 raise ZeluxError("instance_id 参数不能为空", "denied")
+            if op == "instance_enable":
+                try:
+                    snapshot = await driver.refresh()
+                except FAN_ERRORS as exc:
+                    raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+                inventory = snapshot.get("inventory", {}) if isinstance(snapshot, dict) else {}
+                existing = next((item for item in inventory.get("instances", [])
+                                 if item.get("id") == identifier), None)
+                if not existing:
+                    raise ZeluxError("找不到待启用的风扇实例，请刷新状态", "not_found")
+                await self._assert_pwm_mapping_ready(existing)
             try:
                 result = await driver.set_enabled(identifier, op == "instance_enable")
             except FAN_ERRORS as exc:
@@ -179,8 +194,34 @@ class Module(BaseModule):
                 )
         return self._driver
 
+    async def _pwm_readiness(self) -> dict:
+        driver = self._require_instance_driver("pwm_readiness")
+        try:
+            result = await driver.pwm_readiness()
+        except FAN_ERRORS as exc:
+            raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+        return {"ok": True, **result}
+
+    async def _pwm_setup(self, op: str, args: dict) -> dict:
+        driver = self._require_instance_driver("pwm_setup")
+        setup_op = op.removeprefix("pwm_setup_")
+        pin_id = args.get("pin_id", "")
+        token = args.get("token", "")
+        if not isinstance(pin_id, str) or len(pin_id) > 64 or not isinstance(token, str) or len(token) > 128:
+            raise ZeluxError("PWM 配置请求字段无效", "denied")
+        if setup_op in ("preview", "apply", "rollback") and not pin_id:
+            raise ZeluxError("必须指定物理 PWM 引脚档案", "denied")
+        if setup_op in ("apply", "rollback") and args.get("confirm") is not True:
+            raise ZeluxError("该操作必须由用户明确确认", "denied")
+        try:
+            return await driver.pwm_setup(setup_op, pin_id=pin_id, token=token,
+                                          confirm=args.get("confirm") is True)
+        except FAN_ERRORS as exc:
+            raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+
     async def _instance_create(self, args: dict) -> dict:
         driver = self._require_instance_driver("create_instance")
+        self._require_instance_driver("pwm_setup")
         instance = args.get("instance")
         if not isinstance(instance, dict):
             raise ZeluxError("instance 参数必须是字典", "denied")
@@ -189,12 +230,34 @@ class Module(BaseModule):
         instance_id = instance.get("id")
         if not instance_id:
             raise ZeluxError("instance 必须包含有效的 id", "denied")
+        pin_id = instance.get("pwm_pin")
+        mapping = instance.get("pwm")
+        if not isinstance(pin_id, str) or not pin_id or not isinstance(mapping, dict):
+            raise ZeluxError("必须选择已验证就绪的物理 PWM 引脚", "denied")
+        await self._assert_pwm_mapping_ready(instance)
         try:
             result = await driver.create_instance(instance)
         except FAN_ERRORS as exc:
             raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
         self._raise_on_driver_failure(result, "创建风扇实例失败")
         return {"ok": True, "result": result, "fan": self.state()["fan"]}
+
+    async def _assert_pwm_mapping_ready(self, instance: dict) -> None:
+        driver = self._require_instance_driver("pwm_setup")
+        pin_id, mapping = instance.get("pwm_pin"), instance.get("pwm")
+        if not isinstance(pin_id, str) or not pin_id or not isinstance(mapping, dict):
+            raise ZeluxError("必须选择已验证就绪的物理 PWM 引脚", "denied")
+        try:
+            readiness = await driver.pwm_setup("status")
+        except FAN_ERRORS as exc:
+            raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+        profile = readiness.get("pwm_setup", {})
+        pin = next((item for item in profile.get("mapped_pins", [])
+                    if item.get("id") == pin_id), None)
+        if not pin or pin.get("ready") is not True:
+            raise ZeluxError("所选 PWM 物理引脚尚未通过设备端运行状态验证；请先配置 overlay、重启并刷新状态", "not_ready")
+        if mapping.get("chip") != pin.get("chip") or mapping.get("channel") != pin.get("channel"):
+            raise ZeluxError("PWM 引脚映射与设备端硬件档案不一致，请刷新引脚状态后重新选择", "mapping_mismatch")
 
     async def _instance_update(self, args: dict) -> dict:
         driver = self._require_instance_driver("update_instance")
@@ -214,6 +277,8 @@ class Module(BaseModule):
                 f"instance_id({instance_id}) 与 instance.id({instance_body_id}) 不匹配",
                 "denied"
             )
+        if instance.get("enabled") is not False:
+            await self._assert_pwm_mapping_ready(instance)
         try:
             result = await driver.update_instance(str(instance_id), instance)
         except FAN_ERRORS as exc:

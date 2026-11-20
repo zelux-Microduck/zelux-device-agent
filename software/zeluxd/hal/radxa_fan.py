@@ -205,6 +205,15 @@ class RadxaFan:
         self.error = ""
         return status
 
+    async def pwm_readiness(self) -> dict:
+        """Read-only kernel PWM inventory and board profile readiness."""
+        return await self.helper.call({"op": "pwm_readiness"})
+
+    async def pwm_setup(self, *args, **kwargs) -> dict:
+        from zelux_drivers.radxa.fan import RadxaFan as IndependentRadxaFan
+        adapter = IndependentRadxaFan(helper_path=self.helper.path)
+        return await adapter.pwm_setup(*args, **kwargs)
+
     async def _command(self, payload: dict) -> dict:
         async with self._io_lock:
             result = await self.helper.call(payload)

@@ -64,6 +64,15 @@ class FakeFanDriver:
         self.deleted.append(instance_id)
         return {"ok": True, "id": instance_id, "deleted": True}
 
+    async def pwm_setup(self, op: str, **_kwargs) -> dict:
+        return {"api_version": 1, "ok": True, "pwm_setup": {
+            "mapped_pins": [{"id": "radxa-zero3w-pin24-pwm13-m1", "ready": True,
+                             "chip": 0, "channel": 0}]}}
+
+    async def refresh(self) -> dict:
+        return {"inventory": {"instances": [{"id": "cooling-main", "enabled": True,
+            "pwm_pin": "radxa-zero3w-pin24-pwm13-m1", "pwm": {"chip": 0, "channel": 0}}]}}
+
 
 class FanInstanceApiTests(unittest.TestCase):
     """Test fan instance CRUD API safety."""
@@ -91,7 +100,9 @@ class FanInstanceApiTests(unittest.TestCase):
             {"ok": False, "code": "resource_busy", "error": "PWM occupied"}))
         module = Module(FakeContext(driver=driver))
         with self.assertRaises(ZeluxError) as caught:
-            self.loop.run_until_complete(module.cmd("instance_create", {"instance": {"id": "cooling-main"}}))
+            self.loop.run_until_complete(module.cmd("instance_create", {"instance": {
+                "id": "cooling-main", "pwm_pin": "radxa-zero3w-pin24-pwm13-m1",
+                "pwm": {"chip": 0, "channel": 0}}}))
         self.assertEqual(caught.exception.code, "resource_busy")
 
         reader = AsyncMock()
@@ -116,6 +127,14 @@ class FanInstanceApiTests(unittest.TestCase):
                 self.loop.run_until_complete(FanHelper("/unused").call({"op": "create"}))
         self.assertEqual(caught.exception.code, "resource_busy")
 
+    def test_pwm_readiness_forwards_read_only_probe(self) -> None:
+        driver = FakeFanDriver()
+        driver.pwm_readiness = AsyncMock(return_value={"ok": True, "pwm_readiness": {"state": "overlay_required"}})
+        module = Module(FakeContext(driver=driver))
+        result = self.loop.run_until_complete(module.cmd("op", {"op": "pwm_readiness"}))
+        self.assertEqual(result["pwm_readiness"]["state"], "overlay_required")
+        driver.pwm_readiness.assert_awaited_once_with()
+
     def test_pin_config_raises_unsupported(self) -> None:
         """pin_config should be deprecated with clear error."""
         driver = FakeFanDriver()
@@ -136,11 +155,35 @@ class FanInstanceApiTests(unittest.TestCase):
         module = Module(ctx)
 
         result = self.loop.run_until_complete(
-            module.cmd("instance_create", {"instance": {"id": "fan-0", "pin": 33}})
+            module.cmd("instance_create", {"instance": {"id": "fan-0",
+                "pwm_pin": "radxa-zero3w-pin24-pwm13-m1", "pwm": {"chip": 0, "channel": 0}}})
         )
         self.assertTrue(result["ok"])
         self.assertEqual(len(driver.created), 1)
         self.assertEqual(driver.created[0]["id"], "fan-0")
+
+    def test_create_is_rejected_when_selected_pin_is_not_ready(self) -> None:
+        driver = FakeFanDriver()
+        driver.pwm_setup = AsyncMock(return_value={"api_version": 1, "ok": True,
+            "pwm_setup": {"mapped_pins": [{"id": "radxa-zero3w-pin24-pwm13-m1",
+                                           "ready": False, "chip": None, "channel": 0}]}})
+        module = Module(FakeContext(driver=driver))
+        with self.assertRaises(ZeluxError) as caught:
+            self.loop.run_until_complete(module.cmd("instance_create", {"instance": {
+                "id": "fan-0", "pwm_pin": "radxa-zero3w-pin24-pwm13-m1",
+                "pwm": {"chip": 0, "channel": 0}}}))
+        self.assertEqual(caught.exception.code, "not_ready")
+        self.assertEqual(driver.created, [])
+
+    def test_create_is_rejected_when_chip_mapping_does_not_match_pin(self) -> None:
+        driver = FakeFanDriver()
+        module = Module(FakeContext(driver=driver))
+        with self.assertRaises(ZeluxError) as caught:
+            self.loop.run_until_complete(module.cmd("instance_create", {"instance": {
+                "id": "fan-0", "pwm_pin": "radxa-zero3w-pin24-pwm13-m1",
+                "pwm": {"chip": 3, "channel": 0}}}))
+        self.assertEqual(caught.exception.code, "mapping_mismatch")
+        self.assertEqual(driver.created, [])
 
     def test_create_rejection_is_not_reported_as_success(self) -> None:
         driver = FakeFanDriver()
@@ -149,7 +192,8 @@ class FanInstanceApiTests(unittest.TestCase):
 
         with self.assertRaises(ZeluxError) as caught:
             self.loop.run_until_complete(
-                module.cmd("instance_create", {"instance": {"id": "fan-0"}})
+                module.cmd("instance_create", {"instance": {"id": "fan-0",
+                    "pwm_pin": "radxa-zero3w-pin24-pwm13-m1", "pwm": {"chip": 0, "channel": 0}}})
             )
 
         self.assertEqual(caught.exception.code, "hardware")
@@ -196,7 +240,8 @@ class FanInstanceApiTests(unittest.TestCase):
         result = self.loop.run_until_complete(
             module.cmd("instance_update", {
                 "instance_id": "fan-0",
-                "instance": {"id": "fan-0", "pin": 35}
+                "instance": {"id": "fan-0", "pin": 35, "enabled": True,
+                    "pwm_pin": "radxa-zero3w-pin24-pwm13-m1", "pwm": {"chip": 0, "channel": 0}}
             })
         )
         self.assertTrue(result["ok"])
@@ -289,7 +334,8 @@ class FanInstanceApiTests(unittest.TestCase):
         # All should raise ZeluxError with "unavailable" code
         with self.assertRaises(ZeluxError) as exc:
             self.loop.run_until_complete(
-                module.cmd("instance_create", {"instance": {"id": "fan-0"}})
+                module.cmd("instance_create", {"instance": {"id": "fan-0",
+                    "pwm_pin": "radxa-zero3w-pin24-pwm13-m1", "pwm": {"chip": 0, "channel": 0}}})
             )
         self.assertEqual(exc.exception.code, "unavailable")
         self.assertNotIsInstance(exc.exception, AttributeError)
@@ -323,7 +369,8 @@ class FanInstanceApiTests(unittest.TestCase):
         # create_instance missing
         with self.assertRaises(ZeluxError) as exc:
             self.loop.run_until_complete(
-                module.cmd("instance_create", {"instance": {"id": "fan-0"}})
+                module.cmd("instance_create", {"instance": {"id": "fan-0",
+                    "pwm_pin": "radxa-zero3w-pin24-pwm13-m1", "pwm": {"chip": 0, "channel": 0}}})
             )
         self.assertEqual(exc.exception.code, "unsupported")
         self.assertIn("create_instance", exc.exception.message)
