@@ -142,6 +142,19 @@ class FanInstanceApiTests(unittest.TestCase):
         self.assertEqual(len(driver.created), 1)
         self.assertEqual(driver.created[0]["id"], "fan-0")
 
+    def test_create_rejection_is_not_reported_as_success(self) -> None:
+        driver = FakeFanDriver()
+        driver.create_instance = AsyncMock(return_value={"ok": False, "error": "PWM channel busy"})
+        module = Module(FakeContext(driver=driver))
+
+        with self.assertRaises(ZeluxError) as caught:
+            self.loop.run_until_complete(
+                module.cmd("instance_create", {"instance": {"id": "fan-0"}})
+            )
+
+        self.assertEqual(caught.exception.code, "hardware")
+        self.assertIn("PWM channel busy", caught.exception.message)
+
     def test_instance_create_requires_dict_instance(self) -> None:
         """create_instance should reject non-dict instance."""
         driver = FakeFanDriver()

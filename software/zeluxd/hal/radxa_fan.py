@@ -31,6 +31,10 @@ class FanRequestError(FanUnavailable):
         self.response = response
 
 
+class FanOutcomeUnknown(FanUnavailable):
+    code = "outcome_unknown"
+
+
 def clamp_pct(pct: Any, lo: int = 0, hi: int = 100) -> int:
     try:
         value = int(round(float(pct)))
@@ -87,8 +91,7 @@ class FanHelper:
         if not hasattr(asyncio, "open_unix_connection"):
             raise FanUnavailable("当前平台不支持 Unix socket")
         request = {"api_version": SOCKET_API_VERSION, **payload}
-        # Up to 16 optional tach inputs are sampled by the service; selftest
-        # also spins each target briefly. Do not time out healthy multi-fan runs.
+        # Normal status reads cached RPM; only explicit selftest samples inline.
         response_timeout = max(self.timeout, 30.0 if payload.get("op") == "selftest" else 10.0)
         try:
             reader, writer = await asyncio.wait_for(
@@ -101,6 +104,8 @@ class FanHelper:
             await asyncio.wait_for(writer.drain(), timeout=self.timeout)
             line = await asyncio.wait_for(reader.readline(), timeout=response_timeout)
         except (OSError, asyncio.TimeoutError) as exc:
+            if payload.get("op") not in ("status", "ping", "get", "temp", "validate"):
+                raise FanOutcomeUnknown("请求已发送，但未收到确认，操作结果未知；请刷新状态，不要重复创建", str(exc)) from None
             raise FanUnavailable(f"风扇服务请求失败：{exc}", "检查 zelux-fand 服务日志") from None
         finally:
             writer.close()
@@ -111,6 +116,8 @@ class FanHelper:
         try:
             response = json.loads(line.decode("utf-8", "replace"))
         except (ValueError, UnicodeDecodeError):
+            if payload.get("op") not in ("status", "ping", "get", "temp", "validate"):
+                raise FanOutcomeUnknown("服务确认响应缺失或无效，操作结果未知；请刷新核对，不要重放写入") from None
             raise FanUnavailable("风扇服务返回了无效 JSON；Agent 与风扇服务版本可能不兼容") from None
         if not isinstance(response, dict):
             raise FanUnavailable("风扇服务返回了非对象响应")
@@ -145,9 +152,13 @@ class RadxaFan:
         self._snapshot: dict[str, Any] = {"items": [], "inventory": None}
         self._task: asyncio.Task | None = None
         self._closing = False
+        self._io_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        await self.refresh()
+        try:
+            await self.refresh()
+        except FanUnavailable:
+            pass  # Still start recovery polling when fanctl is temporarily down.
         if self._task is None or self._task.done():
             self._closing = False
             self._task = asyncio.create_task(self._refresh_loop(), name="fan-service-status")
@@ -172,14 +183,20 @@ class RadxaFan:
                 self.reason, self.hint = exc.message, exc.hint
 
     async def refresh(self) -> dict:
+        async with self._io_lock:
+            return await self._refresh_unlocked()
+
+    async def _refresh_unlocked(self) -> dict:
         try:
             status = await self.helper.call({"op": "status"})
         except FanUnavailable as exc:
-            self.available = False
+            self.available = isinstance(exc, FanRequestError) and exc.code == "resource_busy"
+            self._snapshot = {**self._snapshot, "status_stale": True}
             self.reason, self.hint = exc.message, exc.hint
             raise
-        self._snapshot = status
-        self.fans = [dict(item) for item in status.get("items", []) if isinstance(item, dict)]
+        self._snapshot = {**status, "status_stale": False}
+        inventory = status.get("inventory") if isinstance(status.get("inventory"), dict) else {}
+        self.fans = [dict(item) for item in inventory.get("instances", []) if isinstance(item, dict)]
         self.curve = normalize_curve(status.get("curve"))
         self.mode = "manual" if status.get("mode") == "manual" else "auto"
         self.available = True
@@ -187,6 +204,27 @@ class RadxaFan:
         self.hint = "" if self.fans else "在 Studio 风扇页添加实例并配置 PWM 引脚"
         self.error = ""
         return status
+
+    async def _command(self, payload: dict) -> dict:
+        async with self._io_lock:
+            result = await self.helper.call(payload)
+            if result.get("ok") is not True:
+                raise FanRequestError(result)
+            inventory = result.get("inventory")
+            if isinstance(inventory, dict):
+                ids = {item["id"] for item in inventory.get("instances", []) if item.get("enabled")}
+                self._snapshot = {**self._snapshot, "inventory": inventory,
+                                  "items": [item for item in self._snapshot.get("items", []) if item.get("id") in ids]}
+                self.fans = [dict(item) for item in inventory.get("instances", [])]
+            try:
+                await self._refresh_unlocked()
+            except FanUnavailable as exc:
+                # The write was acknowledged. Never turn a later read failure
+                # into a failed write or invite replay of a successful create.
+                self._snapshot = {**self._snapshot, "status_stale": True}
+                return {**result, "status_stale": True,
+                        "refresh_warning": "操作已确认成功，实时状态刷新失败：" + exc.message}
+            return result
 
     def info(self) -> dict:
         return {"backend": self.backend, "source": self.source, "available": self.available,
@@ -203,6 +241,10 @@ class RadxaFan:
             raise FanUnavailable(f"未知风扇实例：{target!r}") from None
 
     async def set_pct(self, target: Any, pct: Any) -> dict:
+        async with self._io_lock:
+            return await self._set_pct_unlocked(target, pct)
+
+    async def _set_pct_unlocked(self, target: Any, pct: Any) -> dict:
         instance_id = self._instance_id(target)
         value = clamp_pct(pct)
         try:
@@ -219,14 +261,13 @@ class RadxaFan:
                     "hint": exc.hint, "instance_id": instance_id, "pct": value}
 
     async def set_auto(self) -> dict:
-        result = await self.helper.call({"op": "auto"})
+        result = await self._command({"op": "auto"})
         self.mode = "auto"
-        await self.refresh()
         return result
 
     async def set_curve(self, curve: Any) -> dict:
         points = normalize_curve(curve)
-        result = await self.helper.call({"op": "curve", "points": points})
+        result = await self._command({"op": "curve", "points": points})
         self.curve = points
         return result
 
@@ -245,29 +286,22 @@ class RadxaFan:
         return await self.helper.call(payload)
 
     async def create_instance(self, instance: dict) -> dict:
-        result = await self.helper.call({"op": "create", "instance": instance})
-        await self.refresh()
-        return result
+        return await self._command({"op": "create", "instance": instance})
 
     async def update_instance(self, instance_id: str, instance: dict) -> dict:
-        result = await self.helper.call({"op": "update", "instance_id": instance_id, "instance": instance})
-        await self.refresh()
-        return result
+        return await self._command({"op": "update", "instance_id": instance_id, "instance": instance})
 
     async def delete_instance(self, instance_id: str) -> dict:
-        result = await self.helper.call({"op": "delete", "instance_id": instance_id, "confirm": True})
-        await self.refresh()
-        return result
+        return await self._command({"op": "delete", "instance_id": instance_id, "confirm": True})
 
     async def set_enabled(self, instance_id: str, enabled: bool) -> dict:
-        result = await self.helper.call({"op": "enable" if enabled else "disable",
-                                         "instance_id": instance_id})
-        await self.refresh()
-        return result
+        return await self._command({"op": "enable" if enabled else "disable",
+                                    "instance_id": instance_id})
 
     def snapshot_fan(self) -> dict:
         status = self._snapshot
         return {"mode": self.mode, "pct": status.get("pct", DEFAULT_PCT),
+                "status_stale": status.get("status_stale", True),
                 "temp": status.get("temp"), "curve": self.curve,
                 "items": [dict(item) for item in status.get("items", []) if isinstance(item, dict)],
                 "inventory": status.get("inventory"), "available": self.available,

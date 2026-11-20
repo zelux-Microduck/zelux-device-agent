@@ -15,6 +15,12 @@ from ..errors import ZeluxError
 from ..hal.radxa_fan import DEFAULT_PCT, FanUnavailable, clamp_pct, normalize_curve
 from .base import BaseModule
 
+try:
+    from zelux_drivers.radxa.fan import FanUnavailable as PackageFanUnavailable
+except ImportError:
+    PackageFanUnavailable = FanUnavailable
+FAN_ERRORS = (FanUnavailable, PackageFanUnavailable)
+
 class Module(BaseModule):
     name = "fan"
 
@@ -93,6 +99,12 @@ class Module(BaseModule):
 
     # ---------------- 命令 ----------------
     async def cmd(self, op: str, args: dict) -> dict:
+        try:
+            return await self._cmd(op, args)
+        except FAN_ERRORS as exc:
+            raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+
+    async def _cmd(self, op: str, args: dict) -> dict:
         args = args or {}
         if op == "op":
             # 契约：`fan.op` + `{op:"manual", index:0, pct:80}`
@@ -120,8 +132,9 @@ class Module(BaseModule):
                 raise ZeluxError("instance_id 参数不能为空", "denied")
             try:
                 result = await driver.set_enabled(identifier, op == "instance_enable")
-            except FanUnavailable as exc:
+            except FAN_ERRORS as exc:
                 raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+            self._raise_on_driver_failure(result, "修改风扇实例状态失败")
             return {"ok": True, "result": result, "fan": self.state()["fan"]}
         if op in ("self_test", "selftest", "test"):
             return await self._self_test(args)
@@ -178,8 +191,9 @@ class Module(BaseModule):
             raise ZeluxError("instance 必须包含有效的 id", "denied")
         try:
             result = await driver.create_instance(instance)
-        except FanUnavailable as exc:
+        except FAN_ERRORS as exc:
             raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+        self._raise_on_driver_failure(result, "创建风扇实例失败")
         return {"ok": True, "result": result, "fan": self.state()["fan"]}
 
     async def _instance_update(self, args: dict) -> dict:
@@ -202,8 +216,9 @@ class Module(BaseModule):
             )
         try:
             result = await driver.update_instance(str(instance_id), instance)
-        except FanUnavailable as exc:
+        except FAN_ERRORS as exc:
             raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+        self._raise_on_driver_failure(result, "更新风扇实例失败")
         return {"ok": True, "result": result, "fan": self.state()["fan"]}
 
     async def _instance_delete(self, args: dict) -> dict:
@@ -215,16 +230,23 @@ class Module(BaseModule):
             raise ZeluxError("删除风扇会停止并释放该实例，请先确认", "denied")
         try:
             result = await driver.delete_instance(str(instance_id))
-        except FanUnavailable as exc:
+        except FAN_ERRORS as exc:
             raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
+        self._raise_on_driver_failure(result, "删除风扇实例失败")
         return {"ok": True, "result": result, "fan": self.state()["fan"]}
+
+    @staticmethod
+    def _raise_on_driver_failure(result: dict, fallback: str) -> None:
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise ZeluxError(str(result.get("error") or result.get("reason") or fallback),
+                             str(result.get("code") or "hardware"))
 
     async def _set_mode(self, mode: str, args: dict) -> dict:
         if mode == "auto":
             if self._driver is not None and hasattr(self._driver, "set_auto"):
                 try:
                     result = await self._driver.set_auto()
-                except FanUnavailable as exc:
+                except FAN_ERRORS as exc:
                     raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
                 self.mode = "auto"
                 return {"ok": True, **result, "fan": self.state()["fan"]}
@@ -249,7 +271,7 @@ class Module(BaseModule):
         if self._driver is not None and hasattr(self._driver, "set_curve"):
             try:
                 result = await self._driver.set_curve(self.curve)
-            except FanUnavailable as exc:
+            except FAN_ERRORS as exc:
                 raise ZeluxError(exc.message, getattr(exc, "code", "hardware")) from None
         else:
             result = {"ok": self._control == "none", "virtual": True}
@@ -272,7 +294,7 @@ class Module(BaseModule):
         if self._driver is not None and hasattr(self._driver, "self_test"):
             try:
                 res = await self._driver.self_test(args.get("instance_id", args.get("index")))
-            except FanUnavailable as exc:
+            except FAN_ERRORS as exc:
                 raise ZeluxError(exc.message, "denied") from None
             self.log_event("风扇自检：" + ("通过" if res.get("ok") else "有问题，看详情"))
             return res
@@ -292,10 +314,10 @@ class Module(BaseModule):
                 res = await self._set(index, clamp_pct(pct))
             else:
                 res = await self._driver.set_pct(index, clamp_pct(pct))
-        except FanUnavailable as exc:
+        except FAN_ERRORS as exc:
             self.log.warning("风扇调速失败：%s", exc.message)
             return {"ok": False, "index": index, "pct": clamp_pct(pct),
-                    "reason": exc.message, "hint": exc.hint}
+                    "reason": exc.message, "hint": exc.hint, "code": getattr(exc, "code", "hardware")}
         except Exception as exc:
             return {"ok": False, "index": index, "pct": clamp_pct(pct),
                     "reason": f"风扇调速出错：{exc}"}
